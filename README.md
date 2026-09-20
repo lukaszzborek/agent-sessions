@@ -2,6 +2,8 @@
 
 Local web UI over coding-agent session logs (Claude Code, Codex, Pi). Sessions are archived into SQLite, so they outlive the agents' own log cleanup.
 
+![session view](docs/screenshot.png)
+
 - [Run](#run)
 - [What it shows](#what-it-shows)
 - [Storage and live updates](#storage-and-live-updates)
