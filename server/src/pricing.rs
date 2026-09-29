@@ -60,11 +60,12 @@ const fn openai(input: f64, cached: f64, output: f64) -> Price {
 
 fn builtin() -> BTreeMap<String, Price> {
     let t: &[(&str, Price)] = &[
-        // Anthropic (2026-06 list prices).
+        // Anthropic (platform.claude.com/docs/en/about-claude/pricing, 2026-09).
         ("claude-fable-5-1", anthropic(10.0, 50.0, 0.25)),
         ("claude-mythos-5-1", anthropic(10.0, 50.0, 0.25)),
         ("claude-fable-5", anthropic(10.0, 50.0, 1.0)),
         ("claude-mythos-5", anthropic(10.0, 50.0, 1.0)),
+        ("claude-opus-5-5", anthropic(4.0, 20.0, 0.2)),
         ("claude-opus-5", anthropic(5.0, 25.0, 0.5)),
         ("claude-opus-4-8", anthropic(5.0, 25.0, 0.5)),
         ("claude-opus-4-7", anthropic(5.0, 25.0, 0.5)),
