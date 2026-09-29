@@ -50,7 +50,70 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
          );",
     )
     .context("init schema")?;
+    migrate_subagent_ids(&c);
     Ok(c)
+}
+
+/// Claude subagent ids changed from `<agentId>` to `<parentSid>~<agentId>`; re-key the tags and
+/// telemetry stored under the old id. A copied subagent file exists under several parents, so the
+/// row is copied to each new id before the old one is dropped. Finds nothing once migrated.
+fn migrate_subagent_ids(c: &Connection) {
+    let Ok(mut st) = c.prepare("SELECT path FROM sessions WHERE path LIKE '%subagents%'") else {
+        return;
+    };
+    let mut new_ids: HashMap<String, Vec<String>> = HashMap::new();
+    for path in st
+        .query_map([], |r| r.get::<_, String>(0))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = Path::new(&path);
+        let name = |p: Option<&Path>| p?.file_name()?.to_str().map(str::to_string);
+        let dir = path.parent();
+        let (Some(aid), Some(sid)) = (
+            path.file_stem()
+                .and_then(|x| x.to_str())
+                .and_then(|x| x.strip_prefix("agent-")),
+            name(dir.and_then(Path::parent)).filter(|_| name(dir).as_deref() == Some("subagents")),
+        ) else {
+            continue;
+        };
+        new_ids
+            .entry(aid.to_string())
+            .or_default()
+            .push(format!("{sid}~{aid}"));
+    }
+    let claude = Agent::Claude.as_str();
+    for (aid, news) in new_ids {
+        for new in news {
+            warn(
+                "migrate tags",
+                c.execute(
+                    "INSERT OR IGNORE INTO tags (agent, id, tags) SELECT agent, ?1, tags FROM tags WHERE agent=?2 AND id=?3",
+                    params![new, claude, aid],
+                ),
+            );
+            warn(
+                "migrate telemetry",
+                c.execute(
+                    "INSERT OR IGNORE INTO telemetry (id, fetched, data) SELECT ?1, fetched, data FROM telemetry WHERE id=?2",
+                    params![new, aid],
+                ),
+            );
+        }
+        warn(
+            "migrate tags",
+            c.execute(
+                "DELETE FROM tags WHERE agent=?1 AND id=?2",
+                params![claude, aid],
+            ),
+        );
+        warn(
+            "migrate telemetry",
+            c.execute("DELETE FROM telemetry WHERE id=?1", params![aid]),
+        );
+    }
 }
 
 pub fn load_all(c: &Connection) -> HashMap<PathBuf, Row> {
@@ -89,10 +152,21 @@ pub fn load_all(c: &Connection) -> HashMap<PathBuf, Row> {
     .collect()
 }
 
-/// Insert or replace full row (raw stored zstd-compressed).
-pub fn upsert(c: &Connection, path: &Path, row: &Row, raw: &[u8]) {
-    let blob = zstd::encode_all(raw, 3).unwrap_or_default();
-    let _ = c.execute(
+/// Logs a failed write; the index still serves from memory, but the change is lost on restart.
+pub fn warn<T>(what: &str, r: rusqlite::Result<T>) {
+    if let Err(e) = r {
+        eprintln!("db: {what} failed: {e}");
+    }
+}
+
+/// zstd blob as stored in `sessions.raw`; done by the caller so it can run off the db lock.
+pub fn compress(raw: &[u8]) -> Vec<u8> {
+    zstd::encode_all(raw, 3).expect("zstd encoding of an in-memory slice cannot fail")
+}
+
+/// Insert or replace full row; `blob` is `compress`ed raw. False when the write failed.
+pub fn upsert(c: &Connection, path: &Path, row: &Row, blob: &[u8]) -> bool {
+    let r = c.execute(
         "INSERT OR REPLACE INTO sessions (path, agent, mtime, size, version, summary, raw) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
             path.to_string_lossy(),
@@ -104,17 +178,23 @@ pub fn upsert(c: &Connection, path: &Path, row: &Row, raw: &[u8]) {
             blob
         ],
     );
+    let ok = r.is_ok();
+    warn("upsert session", r);
+    ok
 }
 
 /// Update only summary + version (raw unchanged).
 pub fn update_summary(c: &Connection, path: &Path, version: u32, summary: &SessionSummary) {
-    let _ = c.execute(
-        "UPDATE sessions SET version=?1, summary=?2 WHERE path=?3",
-        params![
-            version as i64,
-            serde_json::to_string(summary).unwrap_or_default(),
-            path.to_string_lossy()
-        ],
+    warn(
+        "update session summary",
+        c.execute(
+            "UPDATE sessions SET version=?1, summary=?2 WHERE path=?3",
+            params![
+                version as i64,
+                serde_json::to_string(summary).unwrap_or_default(),
+                path.to_string_lossy()
+            ],
+        ),
     );
 }
 
@@ -150,18 +230,24 @@ pub fn load_tags(c: &Connection) -> HashMap<(Agent, String), Vec<String>> {
 
 pub fn set_tags(c: &Connection, agent: Agent, id: &str, tags: &[String]) {
     if tags.is_empty() {
-        let _ = c.execute(
-            "DELETE FROM tags WHERE agent=?1 AND id=?2",
-            params![agent.as_str(), id],
+        warn(
+            "delete tags",
+            c.execute(
+                "DELETE FROM tags WHERE agent=?1 AND id=?2",
+                params![agent.as_str(), id],
+            ),
         );
     } else {
-        let _ = c.execute(
-            "INSERT OR REPLACE INTO tags (agent, id, tags) VALUES (?1,?2,?3)",
-            params![
-                agent.as_str(),
-                id,
-                serde_json::to_string(tags).unwrap_or_default()
-            ],
+        warn(
+            "save tags",
+            c.execute(
+                "INSERT OR REPLACE INTO tags (agent, id, tags) VALUES (?1,?2,?3)",
+                params![
+                    agent.as_str(),
+                    id,
+                    serde_json::to_string(tags).unwrap_or_default()
+                ],
+            ),
         );
     }
 }
@@ -180,10 +266,13 @@ pub fn telemetry(c: &Connection, id: &str) -> Option<(u64, String)> {
 
 pub fn save_telemetry(c: &Connection, id: &str, fetched: u64, data: &str) {
     // A later `null` means the backends' retention ran out, not that the stored data was wrong.
-    let _ = c.execute(
-        "INSERT INTO telemetry (id, fetched, data) VALUES (?1,?2,?3)
+    warn(
+        "save telemetry",
+        c.execute(
+            "INSERT INTO telemetry (id, fetched, data) VALUES (?1,?2,?3)
          ON CONFLICT(id) DO UPDATE SET fetched=excluded.fetched, data=CASE WHEN excluded.data='null' THEN data ELSE excluded.data END",
-        params![id, fetched as i64, data],
+            params![id, fetched as i64, data],
+        ),
     );
 }
 
@@ -199,8 +288,11 @@ pub fn rtk(c: &Connection, path: &Path) -> Option<String> {
 }
 
 pub fn save_rtk(c: &Connection, path: &Path, rows: &str) {
-    let _ = c.execute(
-        "INSERT INTO rtk (path, rows) VALUES (?1,?2) ON CONFLICT(path) DO UPDATE SET rows=excluded.rows WHERE rows != excluded.rows",
-        params![path.to_string_lossy(), rows],
+    warn(
+        "save rtk",
+        c.execute(
+            "INSERT INTO rtk (path, rows) VALUES (?1,?2) ON CONFLICT(path) DO UPDATE SET rows=excluded.rows WHERE rows != excluded.rows",
+            params![path.to_string_lossy(), rows],
+        ),
     );
 }

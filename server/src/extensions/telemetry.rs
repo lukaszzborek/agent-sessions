@@ -1,9 +1,9 @@
 //! Per-session enrichment from Claude Code OTel telemetry (Loki events + Prometheus metrics).
-//! Optional: endpoints come from `~/.config/agent-sessions/config.toml` (`[telemetry]` `loki_url`,
+//! Optional: endpoints come from the config file (`[telemetry]` `loki_url`,
 //! `prom_url`), overridden by `LOKI_URL` / `PROM_URL` env vars. Any failure or absence of data
 //! yields `None`, so the session view never depends on it.
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Req {
@@ -143,106 +143,137 @@ async fn fetch_loki(
         .as_nanos();
     // Pad both ends: events are flushed in batches and the last ones land after the session's
     // final message.
-    let mut start = started
+    let start_ns = started
         .and_then(rfc3339_ns)
         .map(|s| s.saturating_sub(300 * NS))
-        .unwrap_or(now_ns - 30 * 86_400 * NS)
-        .to_string();
-    let end = ended
+        .unwrap_or(now_ns - 30 * 86_400 * NS);
+    let end_ns = ended
         .and_then(rfc3339_ns)
         .map(|e| e.saturating_add(3600 * NS).min(now_ns))
-        .unwrap_or(now_ns)
-        .to_string();
-    loop {
-        let r: serde_json::Value = client
-            .get(format!("{}/loki/api/v1/query_range", base))
-            .query(&[
-                ("query", query.as_str()),
-                ("limit", &LIMIT.to_string()),
-                ("direction", "forward"),
-                ("start", &start),
-                ("end", &end),
-            ])
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut n = 0usize;
-        let mut last_ns: u128 = 0;
-        for stream in r["data"]["result"].as_array().into_iter().flatten() {
-            let m = match stream["stream"].as_object() {
-                Some(m) => m,
-                None => continue,
-            };
-            let entries = stream["values"].as_array().map(|v| v.len()).unwrap_or(0);
-            n += entries;
-            for v in stream["values"].as_array().into_iter().flatten() {
-                if let Some(ts) = v[0].as_str().and_then(|x| x.parse::<u128>().ok()) {
+        .unwrap_or(now_ns);
+    // Loki rejects ranges over its max query length (721h by default), so long sessions are read
+    // in windows.
+    const WINDOW_NS: u128 = 30 * 86_400 * NS;
+    let mut win_start = start_ns;
+    while win_start < end_ns {
+        let win_end = (win_start + WINDOW_NS).min(end_ns);
+        let mut from = win_start;
+        // Entries at the timestamp the previous page ended on. Several entries can share it, so
+        // the next page starts there again and these are dropped.
+        let mut seen: HashSet<(u128, String, String)> = HashSet::new();
+        loop {
+            let (start, end) = (from.to_string(), win_end.to_string());
+            let r: serde_json::Value = client
+                .get(format!("{}/loki/api/v1/query_range", base))
+                .query(&[
+                    ("query", query.as_str()),
+                    ("limit", &LIMIT.to_string()),
+                    ("direction", "forward"),
+                    ("start", &start),
+                    ("end", &end),
+                ])
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?
+                .error_for_status()?
+                .json()
+                .await?;
+            let mut n = 0usize;
+            let mut fresh = 0usize;
+            let mut last_ns: u128 = 0;
+            let mut page_keys = Vec::new();
+            for stream in r["data"]["result"].as_array().into_iter().flatten() {
+                let Some(m) = stream["stream"].as_object() else {
+                    continue;
+                };
+                let labels = stream["stream"].to_string();
+                let mut entries = 0usize;
+                for v in stream["values"].as_array().into_iter().flatten() {
+                    n += 1;
+                    let Some(ts) = v[0].as_str().and_then(|x| x.parse::<u128>().ok()) else {
+                        continue;
+                    };
                     last_ns = last_ns.max(ts);
-                }
-            }
-            match m.get("event_name").and_then(|x| x.as_str()) {
-                Some("api_request") => {
-                    let Some(id) = str_(m, "request_id") else {
-                        continue;
-                    };
-                    let cost: Option<f64> = num(m, "cost_usd");
-                    t.api_requests += entries as u32;
-                    if let Some(c) = cost {
-                        *t.cost_usd.get_or_insert(0.0) += c * entries as f64;
-                    }
-                    t.requests.insert(
-                        id,
-                        Req {
-                            ttft_ms: num(m, "ttft_ms"),
-                            duration_ms: num(m, "duration_ms"),
-                            cost_usd: cost,
-                            effort: str_(m, "effort"),
-                            speed: str_(m, "speed"),
-                        },
+                    let key = (
+                        ts,
+                        v[1].as_str().unwrap_or_default().to_string(),
+                        labels.clone(),
                     );
+                    if !seen.contains(&key) {
+                        entries += 1;
+                    }
+                    page_keys.push(key);
                 }
-                Some("tool_result") => {
-                    let Some(id) = str_(m, "tool_use_id") else {
-                        continue;
-                    };
-                    let e = t.tools.entry(id).or_default();
-                    e.duration_ms = num(m, "duration_ms");
-                    e.success = m
-                        .get("success")
-                        .and_then(|x| x.as_str())
-                        .map(|x| x == "true");
-                    e.input_bytes = num(m, "tool_input_size_bytes");
-                    e.result_bytes = num(m, "tool_result_size_bytes");
+                fresh += entries;
+                if entries == 0 {
+                    continue;
                 }
-                Some("tool_decision") => {
-                    let Some(id) = str_(m, "tool_use_id") else {
-                        continue;
-                    };
-                    let e = t.tools.entry(id).or_default();
-                    e.decision = str_(m, "decision");
-                    e.decision_source = str_(m, "source");
+                match m.get("event_name").and_then(|x| x.as_str()) {
+                    Some("api_request") => {
+                        let Some(id) = str_(m, "request_id") else {
+                            continue;
+                        };
+                        let cost: Option<f64> = num(m, "cost_usd");
+                        t.api_requests += entries as u32;
+                        if let Some(c) = cost {
+                            *t.cost_usd.get_or_insert(0.0) += c * entries as f64;
+                        }
+                        t.requests.insert(
+                            id,
+                            Req {
+                                ttft_ms: num(m, "ttft_ms"),
+                                duration_ms: num(m, "duration_ms"),
+                                cost_usd: cost,
+                                effort: str_(m, "effort"),
+                                speed: str_(m, "speed"),
+                            },
+                        );
+                    }
+                    Some("tool_result") => {
+                        let Some(id) = str_(m, "tool_use_id") else {
+                            continue;
+                        };
+                        let e = t.tools.entry(id).or_default();
+                        e.duration_ms = num(m, "duration_ms");
+                        e.success = m
+                            .get("success")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x == "true");
+                        e.input_bytes = num(m, "tool_input_size_bytes");
+                        e.result_bytes = num(m, "tool_result_size_bytes");
+                    }
+                    Some("tool_decision") => {
+                        let Some(id) = str_(m, "tool_use_id") else {
+                            continue;
+                        };
+                        let e = t.tools.entry(id).or_default();
+                        e.decision = str_(m, "decision");
+                        e.decision_source = str_(m, "source");
+                    }
+                    Some("hook_execution_complete") => {
+                        let name = str_(m, "hook_name")
+                            .or_else(|| str_(m, "hook_event"))
+                            .unwrap_or_default();
+                        let h = t.hooks.entry(name).or_default();
+                        let k = entries as u32;
+                        h.count += k;
+                        h.total_ms += num::<u64>(m, "total_duration_ms").unwrap_or(0) * k as u64;
+                        h.blocking += num::<u32>(m, "num_blocking").unwrap_or(0) * k;
+                        h.errors += num::<u32>(m, "num_non_blocking_error").unwrap_or(0) * k;
+                    }
+                    _ => {}
                 }
-                Some("hook_execution_complete") => {
-                    let name = str_(m, "hook_name")
-                        .or_else(|| str_(m, "hook_event"))
-                        .unwrap_or_default();
-                    let h = t.hooks.entry(name).or_default();
-                    let k = entries as u32;
-                    h.count += k;
-                    h.total_ms += num::<u64>(m, "total_duration_ms").unwrap_or(0) * k as u64;
-                    h.blocking += num::<u32>(m, "num_blocking").unwrap_or(0) * k;
-                    h.errors += num::<u32>(m, "num_non_blocking_error").unwrap_or(0) * k;
-                }
-                _ => {}
             }
+            // No fresh entry on a full page: more than LIMIT entries share one timestamp, and
+            // paging further would repeat it forever.
+            if n < LIMIT || last_ns == 0 || fresh == 0 {
+                break;
+            }
+            seen.extend(page_keys);
+            seen.retain(|k| k.0 == last_ns);
+            from = last_ns;
         }
-        if n < LIMIT || last_ns == 0 {
-            break;
-        }
-        start = (last_ns + 1).to_string();
+        win_start = win_end;
     }
     Ok(())
 }

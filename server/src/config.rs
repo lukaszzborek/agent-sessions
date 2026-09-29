@@ -1,4 +1,4 @@
-//! `~/.config/agent-sessions/config.toml`, with env overrides (`LOKI_URL`, `PROM_URL`).
+//! `agent-sessions/config.toml` in the OS config dir (`~/.config` on Linux), with env overrides (`LOKI_URL`, `PROM_URL`).
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -89,13 +89,16 @@ pub struct Config {
     pub sources: Vec<Source>,
 }
 
+/// Where the config file is looked up (per-OS config dir).
+pub fn path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("agent-sessions/config.toml"))
+}
+
 pub fn get() -> &'static Config {
     static C: OnceLock<Config> = OnceLock::new();
     C.get_or_init(|| {
         let config_dir = dirs::config_dir();
-        let new_path = config_dir
-            .as_ref()
-            .map(|d| d.join("agent-sessions/config.toml"));
+        let new_path = path();
         let mut c: Config = new_path
             .clone()
             .and_then(|p| std::fs::read_to_string(&p).ok().map(|b| (p, b)))

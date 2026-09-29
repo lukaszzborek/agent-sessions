@@ -393,6 +393,8 @@ pub fn parse(path: &Path, data: &[u8], titles: &HashMap<String, String>) -> anyh
         source: String::new(),
         max_context: 0,
         buckets: vec![],
+        request_ids: vec![],
+        dup_request_ids: vec![],
         context_window,
     };
     let st = summary.started.take();

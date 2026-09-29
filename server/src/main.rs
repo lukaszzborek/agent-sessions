@@ -19,21 +19,40 @@ use axum::{
 use extensions::{rtk, telemetry};
 use index::{Index, Roots};
 use model::*;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
+use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
 #[derive(Debug, rust_embed::Embed)]
 #[folder = "../ui/dist/"]
 struct Assets;
 
+/// Last parsed session file, so the detail and its lazy event fetches parse it once.
+#[derive(Debug)]
+struct ParsedCache {
+    path: PathBuf,
+    /// (mtime, size) of the file when parsed
+    stat: (u64, u64),
+    dup_request_ids: Vec<String>,
+    parsed: Arc<Parsed>,
+}
+
 #[derive(Debug)]
 struct AppState {
     roots: Roots,
     index: RwLock<Index>,
     db: Mutex<rusqlite::Connection>,
-    titles: std::collections::HashMap<String, String>,
-    /// keys ("agent/id") of sessions whose files changed on disk
+    /// Mirror of the db's `sessions` table, so a build does not reload every summary. The lock
+    /// also serializes index builds.
+    rows: tokio::sync::Mutex<HashMap<PathBuf, db::Row>>,
+    titles: HashMap<String, String>,
+    /// keys ("agent/id") of sessions whose summary or file changed
     changed: tokio::sync::broadcast::Sender<Vec<String>>,
+    /// When telemetry was last fetched per session id, complete or not.
+    telemetry_tried: Mutex<HashMap<String, Instant>>,
+    parsed: Mutex<Option<ParsedCache>>,
 }
 
 impl AppState {
@@ -50,41 +69,71 @@ impl AppState {
         *self.index.write().unwrap_or_else(PoisonError::into_inner) = idx;
     }
 
-    /// Rebuilds the index off the async runtime.
-    async fn build_index(self: &Arc<Self>) -> Index {
+    /// Runs `f` on the blocking pool: db access and file I/O must not stall async workers.
+    async fn blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&AppState) -> T + Send + 'static,
+    ) -> T {
         let st = self.clone();
-        tokio::task::spawn_blocking(move || index::build(&st.roots, &st.db))
+        tokio::task::spawn_blocking(move || f(&st))
             .await
-            .expect("index build panicked")
+            .expect("blocking task panicked")
+    }
+
+    /// Rebuilds the index off the async runtime and publishes it. Serialized, so an older
+    /// snapshot can never overwrite a newer one.
+    async fn rebuild(self: &Arc<Self>) -> usize {
+        let mut rows = self.rows.lock().await;
+        let mut owned = std::mem::take(&mut *rows);
+        let (idx, owned) = self
+            .blocking(move |st| {
+                let idx = index::build(&st.roots, &st.db, &mut owned);
+                (idx, owned)
+            })
+            .await;
+        *rows = owned;
+        let n = idx.sessions.len();
+        self.set_index(idx);
+        n
     }
 }
 
 type S = State<Arc<AppState>>;
 
-// Binding to loopback does not stop DNS rebinding: a page on a hostile domain re-resolved to
-// 127.0.0.1 would be same-origin with this server and could read every transcript. The port is
-// not compared so the vite dev proxy, which forwards its own Host, keeps working.
-async fn local_host_only(req: Request, next: Next) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
-    let name = host.rsplit_once(':').map_or(
-        host,
-        |(name, port)| {
+fn is_local(authority: &str) -> bool {
+    let name = authority
+        .rsplit_once(':')
+        .map_or(authority, |(name, port)| {
             if port.ends_with(']') {
-                host
+                authority
             } else {
                 name
             }
-        },
-    );
-    if matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
+        });
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]")
+}
+
+// Binding to loopback does not stop DNS rebinding: a page on a hostile domain re-resolved to
+// 127.0.0.1 would be same-origin with this server and could read every transcript. The port is
+// not compared so the vite dev proxy, which forwards its own Host, keeps working.
+// The Origin check covers the reverse: any site can fire a no-cors POST (refresh, tag edits) at
+// 127.0.0.1 with a local Host, but browsers then send its own Origin. Non-browser clients send
+// none.
+async fn local_host_only(req: Request, next: Next) -> Response {
+    if is_local_request(req.headers()) {
         next.run(req).await
     } else {
         StatusCode::FORBIDDEN.into_response()
     }
+}
+
+fn is_local_request(headers: &header::HeaderMap) -> bool {
+    let get = |name| headers.get(name).and_then(|h| h.to_str().ok());
+    is_local(get(header::HOST).unwrap_or_default())
+        && get(header::ORIGIN).is_none_or(|o| {
+            o.split_once("://")
+                .is_some_and(|(_, authority)| is_local(authority))
+        })
 }
 
 #[tokio::main]
@@ -92,18 +141,26 @@ async fn main() -> anyhow::Result<()> {
     let roots = Roots::default_roots()?;
     let db = Mutex::new(db::open(&roots.db_file)?);
     eprintln!("db: {}", roots.db_file.display());
+    match config::path() {
+        Some(p) => eprintln!("config: {}", p.display()),
+        None => eprintln!("config: no config dir on this OS, using defaults"),
+    }
     if config::get().telemetry.enabled && telemetry::enabled() {
         eprintln!("telemetry: enabled");
     }
-    let index = index::build(&roots, &db);
+    let mut rows = db::load_all(&db.lock().unwrap_or_else(PoisonError::into_inner));
+    let index = index::build(&roots, &db, &mut rows);
     let titles = parsers::codex::load_titles(&roots.codex_homes());
     let (changed, _) = tokio::sync::broadcast::channel(16);
     let state = Arc::new(AppState {
         roots,
         index: RwLock::new(index),
         db,
+        rows: tokio::sync::Mutex::new(rows),
         titles,
         changed,
+        telemetry_tried: Mutex::new(HashMap::new()),
+        parsed: Mutex::new(None),
     });
     tokio::spawn(watch_files(state.clone()));
     tokio::spawn(sync_external(state.clone()));
@@ -160,18 +217,16 @@ fn open_browser(url: &str) {
 }
 
 async fn list_sessions(State(st): S) -> Json<Vec<SessionSummary>> {
-    Json(st.index().sessions.clone())
-}
-
-async fn rebuild(st: &Arc<AppState>) -> usize {
-    let idx = st.build_index().await;
-    let n = idx.sessions.len();
-    st.set_index(idx);
-    n
+    let mut sessions = st.index().sessions.clone();
+    // Indexer bookkeeping, not for the UI.
+    for s in &mut sessions {
+        s.dup_request_ids.clear();
+    }
+    Json(sessions)
 }
 
 async fn refresh(State(st): S) -> Json<usize> {
-    Json(rebuild(&st).await)
+    Json(st.rebuild().await)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -191,10 +246,11 @@ async fn set_tags(
 ) -> Result<Json<Vec<String>>, StatusCode> {
     let a = Agent::parse(&agent).ok_or(StatusCode::NOT_FOUND)?;
     find(&st, &agent, &id).ok_or(StatusCode::NOT_FOUND)?;
-    {
+    let sid = id.clone();
+    st.blocking(move |st| {
         let conn = st.db();
         let mut tags = db::load_tags(&conn)
-            .remove(&(a, id.clone()))
+            .remove(&(a, sid.clone()))
             .unwrap_or_default();
         for t in edit.add.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
             if !tags.iter().any(|x| x == t) {
@@ -202,34 +258,46 @@ async fn set_tags(
             }
         }
         tags.retain(|t| !edit.remove.contains(t));
-        db::set_tags(&conn, a, &id, &tags);
-    }
-    rebuild(&st).await;
+        db::set_tags(&conn, a, &sid, &tags);
+    })
+    .await;
+    st.rebuild().await;
+    let _ = st.changed.send(vec![format!("{agent}/{id}")]);
     Ok(Json(
         find(&st, &agent, &id).map(|s| s.tags).unwrap_or_default(),
     ))
+}
+
+/// "agent/id" -> serialized summary, to tell which sessions a rebuild changed.
+fn summaries_json(idx: &Index) -> HashMap<String, String> {
+    idx.sessions
+        .iter()
+        .map(|s| {
+            (
+                format!("{}/{}", s.agent.as_str(), s.id),
+                serde_json::to_string(s).unwrap_or_default(),
+            )
+        })
+        .collect()
 }
 
 /// Poll session dirs; on any file change rebuild index and broadcast affected session keys.
 async fn watch_files(st: Arc<AppState>) {
     let mut snap = index::snapshot(&st.roots);
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let st2 = st.clone();
-        let cur = tokio::task::spawn_blocking(move || index::snapshot(&st2.roots))
-            .await
-            .expect("snapshot panicked");
-        let mut changed: Vec<&std::path::PathBuf> = cur
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let cur = st.blocking(|st| index::snapshot(&st.roots)).await;
+        let changed: HashSet<PathBuf> = cur
             .iter()
             .filter(|(p, m)| snap.get(*p) != Some(m))
-            .map(|(p, _)| p)
+            .map(|(p, _)| p.clone())
+            .chain(snap.keys().filter(|p| !cur.contains_key(*p)).cloned())
             .collect();
-        changed.extend(snap.keys().filter(|p| !cur.contains_key(*p)));
         if changed.is_empty() {
             continue;
         }
         // A changed meta file isn't any session's path; map it to the run dir it tags instead.
-        let changed_run_dirs: std::collections::HashSet<&std::path::Path> = changed
+        let changed_run_dirs: HashSet<PathBuf> = changed
             .iter()
             .filter(|p| {
                 st.roots
@@ -237,22 +305,32 @@ async fn watch_files(st: Arc<AppState>) {
                     .iter()
                     .any(|s| s.meta.as_deref() == p.file_name().and_then(|x| x.to_str()))
             })
-            .filter_map(|p| p.parent())
+            .filter_map(|p| p.parent().map(std::path::Path::to_path_buf))
             .collect();
-        let idx = st.build_index().await;
-        let keys: Vec<String> = idx
-            .sessions
-            .iter()
-            .filter(|s| {
-                changed.contains(&&s.path)
-                    || st
-                        .roots
-                        .run_dir_of(&s.path)
-                        .is_some_and(|d| changed_run_dirs.contains(d.as_path()))
+        // A build also changes sessions whose own file did not (a parent gaining a child, request
+        // ownership moving), so those are found by comparing against the previous index.
+        let before = st.blocking(|st| summaries_json(&st.index())).await;
+        st.rebuild().await;
+        // run_dir_of stats ancestors of every session, so it only runs when a meta file changed.
+        let keys: Vec<String> = st
+            .blocking(move |st| {
+                st.index()
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        changed.contains(&s.path)
+                            || before.get(&format!("{}/{}", s.agent.as_str(), s.id))
+                                != Some(&serde_json::to_string(s).unwrap_or_default())
+                            || (!changed_run_dirs.is_empty()
+                                && st
+                                    .roots
+                                    .run_dir_of(&s.path)
+                                    .is_some_and(|d| changed_run_dirs.contains(&d)))
+                    })
+                    .map(|s| format!("{}/{}", s.agent.as_str(), s.id))
+                    .collect()
             })
-            .map(|s| format!("{}/{}", s.agent.as_str(), s.id))
-            .collect();
-        st.set_index(idx);
+            .await;
         snap = cur;
         let _ = st.changed.send(keys);
     }
@@ -284,24 +362,45 @@ async fn parse_session(
     id: String,
 ) -> Result<(SessionSummary, Vec<Event>), StatusCode> {
     let summary = find(&st, &agent, &id).ok_or(StatusCode::NOT_FOUND)?;
-    let path = summary.path.clone();
-    let st2 = st.clone();
-    let parsed = tokio::task::spawn_blocking(move || {
-        let data = std::fs::read(&path)
-            .ok()
-            .or_else(|| db::raw(&st2.db(), &path))
-            .ok_or_else(|| anyhow::anyhow!("no source on disk or in db"))?;
-        index::parse_bytes(summary.agent, &path, &data, &st2.titles)
-    })
-    .await
-    .expect("session parse panicked")
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let indexed = summary.clone();
+    let parsed = st
+        .blocking(move |st| {
+            let path = &summary.path;
+            let stat = index::stat(path);
+            let cached = st.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(c) = cached.as_ref().filter(|c| {
+                c.path == *path && c.stat == stat && c.dup_request_ids == summary.dup_request_ids
+            }) {
+                return Ok(c.parsed.clone());
+            }
+            drop(cached);
+            let data = index::read_source(path, &st.db)
+                .ok_or_else(|| anyhow::anyhow!("no source on disk or in db"))?;
+            let skip: HashSet<String> = summary.dup_request_ids.iter().cloned().collect();
+            let parsed = Arc::new(index::parse_bytes(
+                summary.agent,
+                path,
+                &data,
+                &st.titles,
+                &skip,
+            )?);
+            *st.parsed.lock().unwrap_or_else(PoisonError::into_inner) = Some(ParsedCache {
+                path: path.clone(),
+                stat,
+                dup_request_ids: summary.dup_request_ids,
+                parsed: parsed.clone(),
+            });
+            anyhow::Ok(parsed)
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     // Keep children links from the index (computed across files).
-    let mut s = parsed.summary;
-    s.children = summary.children;
-    s.title = summary.title;
-    s.archived = summary.archived;
-    let mut events = parsed.events;
+    let mut s = parsed.summary.clone();
+    s.request_ids.clear();
+    s.children = indexed.children;
+    s.title = indexed.title;
+    s.archived = indexed.archived;
+    let mut events = parsed.events.clone();
     // Link subagent spawn events to children via child's spawn_tool_call_id.
     {
         let idx = st.index();
@@ -347,12 +446,18 @@ async fn get_session(
 ) -> Result<Json<SessionDetail>, StatusCode> {
     let (summary, mut events) = parse_session(st.clone(), agent, id).await?;
     if config::get().rtk.enabled {
-        rtk::annotate(
-            &st.db(),
-            st.roots.run_dir_of(&summary.path).as_deref(),
-            &summary.path,
-            &mut events,
-        );
+        let path = summary.path.clone();
+        events = st
+            .blocking(move |st| {
+                rtk::annotate(
+                    &st.db(),
+                    st.roots.run_dir_of(&path).as_deref(),
+                    &path,
+                    &mut events,
+                );
+                events
+            })
+            .await;
     }
     truncate_events(&mut events);
     Ok(Json(SessionDetail { summary, events }))
@@ -388,7 +493,8 @@ async fn telemetry_of(
     st: &Arc<AppState>,
     summary: &SessionSummary,
 ) -> Option<telemetry::Telemetry> {
-    let stored = db::telemetry(&st.db(), &summary.id);
+    let sid = summary.id.clone();
+    let stored = st.blocking(move |st| db::telemetry(&st.db(), &sid)).await;
     let stored_data = || {
         stored.as_ref().and_then(|(_, d)| {
             serde_json::from_str::<Option<telemetry::Telemetry>>(d)
@@ -407,12 +513,36 @@ async fn telemetry_of(
     if is_final || !telemetry::enabled() {
         return stored_data();
     }
+    // A live session is never final, and every UI reload asks again; an incomplete fetch is not
+    // stored, so the attempt time is kept apart from the db's `fetched`.
+    let recent = {
+        let mut tried = st
+            .telemetry_tried
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let recent = tried
+            .get(&summary.id)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+        if !recent {
+            tried.insert(summary.id.clone(), Instant::now());
+        }
+        recent
+    };
+    if recent {
+        return stored_data();
+    }
     // Subagent events are exported under the root session's id; per-request/per-tool ids stay
     // unique, but session-level counters would be the parent's, so children get only the joinable
     // parts.
     let agent = summary.agent.as_str();
     let mut root = summary.clone();
-    while let Some(p) = root.parent_id.clone().and_then(|p| find(st, agent, &p)) {
+    let mut visited = HashSet::from([root.id.clone()]);
+    while let Some(p) = root
+        .parent_id
+        .clone()
+        .and_then(|p| find(st, agent, &p))
+        .filter(|p| visited.insert(p.id.clone()))
+    {
         root = p;
     }
     let (mut t, complete) = telemetry::fetch(
@@ -432,12 +562,10 @@ async fn telemetry_of(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        db::save_telemetry(
-            &st.db(),
-            &summary.id,
-            now,
-            &serde_json::to_string(&t).unwrap_or_default(),
-        );
+        let sid = summary.id.clone();
+        let data = serde_json::to_string(&t).unwrap_or_default();
+        st.blocking(move |st| db::save_telemetry(&st.db(), &sid, now, &data))
+            .await;
     }
     t.or_else(stored_data)
 }
@@ -449,14 +577,20 @@ async fn sync_external(st: Arc<AppState>) {
         let sessions = st.index().sessions.clone();
         let cfg = config::get();
         for s in &sessions {
-            if let Some(dir) = st.roots.run_dir_of(&s.path).filter(|_| cfg.rtk.enabled) {
-                rtk::snapshot(&st.db(), &dir, &s.path);
+            if cfg.rtk.enabled {
+                let path = s.path.clone();
+                st.blocking(move |st| {
+                    if let Some(dir) = st.roots.run_dir_of(&path) {
+                        rtk::snapshot(&st.db(), &dir, &path);
+                    }
+                })
+                .await;
             }
             if s.agent == Agent::Claude && cfg.telemetry.enabled {
                 telemetry_of(&st, s).await;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        tokio::time::sleep(Duration::from_secs(600)).await;
     }
 }
 

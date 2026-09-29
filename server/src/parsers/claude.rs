@@ -1,11 +1,33 @@
 use super::{read_jsonl, s, u};
 use crate::model::*;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
+/// `skip`: request ids whose usage another file counts (`SessionSummary::dup_request_ids`).
+pub fn parse(path: &Path, data: &[u8], skip: &HashSet<String>) -> anyhow::Result<Parsed> {
     let lines = read_jsonl(data);
+    let file_id = path
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_string();
+    let is_sub = file_id.starts_with("agent-");
+    // Path: <proj>/<sid>/subagents/agent-x.jsonl. Older versions wrote a flat
+    // <proj>/agent-x.jsonl whose parent cannot be told from the path; those keep the bare id.
+    let parent_id = path
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "subagents"))
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|x| x.to_str())
+        .filter(|_| is_sub)
+        .map(str::to_string);
+    // Claude Code writes the same `agent-<id>` file under every session that continues the parent,
+    // so the bare agent id is not unique; scoping it by the parent session is. No `/`, as ids go
+    // into URLs and `agent/id` tag keys.
+    let scope = parent_id.as_deref().unwrap_or(&file_id);
+    let children_scoped = parent_id.is_some() || path.with_extension("").join("subagents").is_dir();
     let mut events: Vec<Event> = Vec::new();
     // Streaming writes one line per content block under the same requestId; early lines carry
     // partial output_tokens, so usage is settled per request and summed after the loop.
@@ -105,10 +127,15 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
                                     }
                                     // Subagent link.
                                     if let Some(aid) = v["toolUseResult"]["agentId"].as_str() {
-                                        e.child_session_id = Some(aid.to_string());
-                                        if !children.contains(&aid.to_string()) {
-                                            children.push(aid.to_string());
+                                        let cid = if children_scoped {
+                                            format!("{scope}~{aid}")
+                                        } else {
+                                            aid.to_string()
+                                        };
+                                        if !children.contains(&cid) {
+                                            children.push(cid.clone());
                                         }
+                                        e.child_session_id = Some(cid);
                                         let mut meta = serde_json::Map::new();
                                         for k in ["status", "resolvedModel", "description"] {
                                             if let Some(x) = v["toolUseResult"].get(k) {
@@ -147,7 +174,7 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
                     let key = req
                         .clone()
                         .unwrap_or_else(|| s(v, "uuid").unwrap_or_default());
-                    if !uu.is_zero() {
+                    if !uu.is_zero() && !key.is_empty() && !skip.contains(&key) {
                         let r = req_usage.entry(key.clone()).or_default();
                         if uu.output >= r.0.output {
                             r.1 = model.as_deref().and_then(|m| crate::pricing::cost(m, &uu));
@@ -281,6 +308,8 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
         }
     }
 
+    let mut request_ids: Vec<String> = req_usage.keys().cloned().collect();
+    request_ids.sort_unstable();
     for (u, c, idx) in req_usage.into_values() {
         usage.add(&u);
         if let Some(c) = c {
@@ -343,26 +372,12 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
         i += 1;
     }
 
-    let file_id = path
-        .file_stem()
-        .and_then(|x| x.to_str())
-        .unwrap_or("")
-        .to_string();
-    let is_sub = file_id.starts_with("agent-");
-    let id_final = if is_sub {
-        file_id.trim_start_matches("agent-").to_string()
-    } else {
-        sid.unwrap_or(file_id)
-    };
-    let parent_id = if is_sub {
-        // Path: <proj>/<sid>/subagents/agent-x.jsonl.
-        path.parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.file_name())
-            .and_then(|x| x.to_str())
-            .map(|x| x.to_string())
-    } else {
-        None
+    let id_final = match file_id.strip_prefix("agent-") {
+        Some(aid) => match &parent_id {
+            Some(p) => format!("{p}~{aid}"),
+            None => aid.to_string(),
+        },
+        None => sid.unwrap_or(file_id),
     };
     let mut summary = SessionSummary {
         agent: Agent::Claude,
@@ -396,6 +411,8 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
         source: String::new(),
         max_context: 0,
         buckets: vec![],
+        request_ids,
+        dup_request_ids: vec![],
         context_window: None,
     };
     if is_sub {
@@ -510,4 +527,85 @@ fn slash_command(content: &Value) -> Option<String> {
         return None;
     }
     Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assistant(req: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","requestId":"{req}","message":{{"model":"claude-sonnet-5","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":10,"output_tokens":5}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn subagent_ids_are_scoped_by_parent_session() {
+        let data = assistant("r1");
+        let a = parse(
+            Path::new("/p/S1/subagents/agent-a1.jsonl"),
+            data.as_bytes(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let b = parse(
+            Path::new("/p/S2/subagents/agent-a1.jsonl"),
+            data.as_bytes(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (a.summary.id.as_str(), a.summary.parent_id.as_deref()),
+            ("S1~a1", Some("S1"))
+        );
+        assert_eq!(
+            (b.summary.id.as_str(), b.summary.parent_id.as_deref()),
+            ("S2~a1", Some("S2"))
+        );
+
+        let parent = r#"{"type":"user","timestamp":"2026-09-01T10:00:00.000Z","sessionId":"S1","toolUseResult":{"agentId":"a1"},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        let dir = std::env::temp_dir().join(format!("agent-sessions-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("S1/subagents")).unwrap();
+        let p = parse(&dir.join("S1.jsonl"), parent.as_bytes(), &HashSet::new()).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(p.summary.children, ["S1~a1"]);
+    }
+
+    #[test]
+    fn flat_subagent_layout_keeps_bare_ids() {
+        let sub = parse(
+            Path::new("/projects/proj/agent-x.jsonl"),
+            assistant("r1").as_bytes(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (sub.summary.id.as_str(), sub.summary.parent_id.as_deref()),
+            ("x", None)
+        );
+
+        let parent = r#"{"type":"user","timestamp":"2026-09-01T10:00:00.000Z","sessionId":"S1","toolUseResult":{"agentId":"x"},"message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#;
+        let p = parse(
+            Path::new("/projects/proj/S1.jsonl"),
+            parent.as_bytes(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(p.summary.children, ["x"]);
+    }
+
+    #[test]
+    fn skipped_request_ids_are_not_counted() {
+        let data = assistant("r1");
+        let path = Path::new("/p/S1.jsonl");
+        let full = parse(path, data.as_bytes(), &HashSet::new()).unwrap();
+        assert_eq!(
+            (full.summary.usage.output, full.summary.request_ids.clone()),
+            (5, vec!["r1".to_string()])
+        );
+        let skip = HashSet::from(["r1".to_string()]);
+        let deduped = parse(path, data.as_bytes(), &skip).unwrap();
+        assert!(deduped.summary.usage.is_zero() && deduped.summary.cost.is_none());
+        assert!(deduped.summary.buckets.is_empty());
+    }
 }

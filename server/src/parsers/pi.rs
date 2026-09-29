@@ -167,6 +167,7 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
                             e.model = model.clone();
                             e.text = Some(String::new());
                             e.usage = Some(uu);
+                            e.cost = ev_cost;
                             events.push(e);
                         }
                     }
@@ -223,6 +224,8 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
         source: String::new(),
         max_context: 0,
         buckets: vec![],
+        request_ids: vec![],
+        dup_request_ids: vec![],
         context_window: None,
     };
     summarize_from_events(&mut summary, &mut events);
@@ -246,5 +249,24 @@ fn blocks_text(c: &Value) -> String {
             .join("\n"),
         Value::Null => String::new(),
         o => json_text(o),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_only_message_keeps_its_cost() {
+        let data = concat!(
+            r#"{"type":"session","id":"s1","cwd":"/x","timestamp":"2026-09-01T10:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"message","timestamp":"2026-09-01T10:00:01.000Z","message":{"role":"assistant","model":"m","content":[],"usage":{"input":10,"output":5,"cost":{"total":0.25}}}}"#,
+            "\n"
+        );
+        let p = parse(Path::new("s1.jsonl"), data.as_bytes()).unwrap();
+        assert_eq!(p.summary.cost, Some(0.25));
+        assert_eq!(p.events.iter().filter_map(|e| e.cost).sum::<f64>(), 0.25);
+        assert_eq!(p.summary.buckets.iter().map(|b| b.cost).sum::<f64>(), 0.25);
     }
 }

@@ -26,16 +26,47 @@ pub fn annotate(conn: &Connection, trial: Option<&Path>, session: &Path, events:
         })
         .map(|(i, _)| i)
         .collect();
+    // A call's rows are logged before its result comes back (or before the session ended, when the
+    // result never did).
+    let last_ts = events.iter().filter_map(|e| e.ts.as_deref()).max();
+    let ends: Vec<Option<String>> = calls
+        .iter()
+        .map(|&i| {
+            events[i]
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| {
+                    events.iter().find(|e| {
+                        e.kind == EventKind::ToolResult && e.tool_call_id.as_deref() == Some(id)
+                    })
+                })
+                // A background call's result returns at once while rtk logs at finish, so only
+                // the session end bounds it.
+                .filter(|e| {
+                    e.meta
+                        .as_ref()
+                        .is_none_or(|m| m.get("backgroundTaskId").is_none())
+                })
+                .and_then(|e| e.ts.as_deref())
+                .or(last_ts)
+                .map(str::to_string)
+        })
+        .collect();
     let mut per_call: Vec<Vec<Value>> = vec![vec![]; calls.len()];
     for (ts, row) in rows {
         // rtk normalizes quoting and flags in `original_cmd`, so text can't be matched; a row is
         // logged while its call runs, which makes the latest call started before it the owner.
-        let owner = calls.iter().rposition(|&i| {
-            events[i]
-                .ts
-                .as_deref()
-                .is_some_and(|t| millis(t) <= millis(&ts))
-        });
+        // Rows past that call's end belong to something else (a subagent's shell, a run without
+        // transcript) and are dropped instead of piling onto it.
+        let owner = calls
+            .iter()
+            .rposition(|&i| {
+                events[i]
+                    .ts
+                    .as_deref()
+                    .is_some_and(|t| millis(t) <= millis(&ts))
+            })
+            .filter(|&c| ends[c].as_deref().is_none_or(|e| millis(&ts) <= millis(e)));
         if let Some(c) = owner {
             per_call[c].push(row);
         }

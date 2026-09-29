@@ -1,11 +1,11 @@
 //! USD per 1M tokens. Built-in table + optional additions/overrides at
-//! ~/.config/agent-sessions/prices.toml (`[model-prefix]` tables with `input`, `output` and
+//! `prices.toml` next to the config file (`[model-prefix]` tables with `input`, `output` and
 //! optional `cache_read`, `cache_write_5m`, `cache_write_1h`).
 use crate::model::Usage;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(from = "FilePrice")]
@@ -71,9 +71,12 @@ fn builtin() -> BTreeMap<String, Price> {
         ("claude-opus-4-7", anthropic(5.0, 25.0, 0.5)),
         ("claude-opus-4-6", anthropic(5.0, 25.0, 0.5)),
         ("claude-opus-4-5", anthropic(5.0, 25.0, 0.5)),
+        ("claude-opus-4-1", anthropic(15.0, 75.0, 1.5)),
         ("claude-opus-4", anthropic(15.0, 75.0, 1.5)),
+        ("claude-sonnet-5-5", anthropic(2.0, 10.0, 0.2)),
         ("claude-sonnet-5", anthropic(2.0, 10.0, 0.2)),
         ("claude-sonnet-4-6", anthropic(3.0, 15.0, 0.3)),
+        ("claude-sonnet-4-5", anthropic(3.0, 15.0, 0.3)),
         ("claude-sonnet-4", anthropic(3.0, 15.0, 0.3)),
         ("claude-haiku-4-5", anthropic(1.0, 5.0, 0.1)),
         // OpenAI (developers.openai.com/api/docs/pricing, 2026-09).
@@ -131,14 +134,36 @@ pub fn fingerprint() -> u32 {
     h.finish() as u32
 }
 
-/// Longest-prefix match on model id (provider prefix like "xai/" stripped).
+/// Longest-prefix match on model id (provider prefix like "xai/" stripped). The rest of the id must
+/// be a date (`-2025…`) or a region/context marker (`@…`, `[…`): a new minor version such as
+/// `claude-sonnet-5-7` must not be silently billed at the `claude-sonnet-5` price. `-codex` and
+/// `-codex-max` variants are billed as their base model; `-codex-mini` is deliberately unpriced.
 pub fn price_for(model: &str) -> Option<Price> {
     let m = model.rsplit('/').next().unwrap_or(model);
-    table()
+    let found = table()
         .iter()
-        .filter(|(k, _)| m.starts_with(k.as_str()))
+        .filter(|(k, _)| {
+            m.strip_prefix(k.as_str()).is_some_and(|r| {
+                let r = r
+                    .strip_prefix("-codex-max")
+                    .or_else(|| r.strip_prefix("-codex"))
+                    .unwrap_or(r);
+                r.is_empty() || ["-20", "@", "["].iter().any(|p| r.starts_with(p))
+            })
+        })
         .max_by_key(|(k, _)| k.len())
-        .map(|(_, p)| *p)
+        .map(|(_, p)| *p);
+    if found.is_none() {
+        static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+        let first = WARNED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(m.to_string());
+        if first {
+            eprintln!("no price for model {m}; add it to prices.toml");
+        }
+    }
+    found
 }
 
 pub fn cost(model: &str, u: &Usage) -> Option<f64> {
@@ -157,6 +182,26 @@ pub fn cost(model: &str, u: &Usage) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_minor_version_is_not_priced_as_family() {
+        assert!(price_for("claude-sonnet-5-7").is_none());
+        assert!(price_for("claude-sonnet-5-7-20261001").is_none());
+        assert_eq!(price_for("claude-sonnet-5").unwrap().input, 2.0);
+        assert_eq!(price_for("claude-sonnet-5-20261001").unwrap().input, 2.0);
+        assert_eq!(price_for("claude-opus-5-5[1m]").unwrap().input, 4.0);
+        assert_eq!(price_for("claude-sonnet-4-5-20250929").unwrap().input, 3.0);
+        assert_eq!(price_for("gpt-5-codex").unwrap().input, 1.25);
+        assert_eq!(price_for("gpt-5.1-codex-max").unwrap().input, 1.25);
+        assert_eq!(price_for("gpt-5.2-codex").unwrap().input, 1.75);
+        assert!(price_for("gpt-5.1-codex-mini").is_none());
+        assert_eq!(
+            price_for("anthropic/claude-opus-4-1@20250805")
+                .unwrap()
+                .input,
+            15.0
+        );
+    }
 
     #[test]
     fn file_price_defaults_cache_to_input() {

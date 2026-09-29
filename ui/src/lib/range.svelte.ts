@@ -1,5 +1,3 @@
-import type { Session } from './types'
-
 export type Preset = 'today' | '7d' | '30d' | '90d' | 'mtd' | 'prev' | 'all' | 'custom'
 
 // shared by Stats + SessionStats views; yyyy-mm-dd local time, inclusive, '' = unbounded
@@ -22,13 +20,11 @@ export function applyPreset(p: Preset) {
 }
 applyPreset(range.preset)
 
-export function inRange(sessions: Session[]): Session[] {
-  const lo = range.from ? new Date(range.from + 'T00:00').getTime() : -Infinity
-  const hi = range.to ? new Date(range.to + 'T00:00').getTime() + 864e5 : Infinity
-  if (lo === -Infinity && hi === Infinity) return sessions
-  return sessions.filter((s) => {
-    if (!s.started) return false
-    const t = new Date(s.started).getTime()
-    return t >= lo && t < hi
-  })
-}
+// presets are relative to today: re-resolve them once the date rolls over
+let day = iso(new Date())
+setInterval(() => {
+  const d = iso(new Date())
+  if (d === day) return
+  day = d
+  if (range.preset !== 'custom') applyPreset(range.preset)
+}, 60_000)

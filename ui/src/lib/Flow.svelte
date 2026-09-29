@@ -41,6 +41,8 @@
   // byKey read inside is untracked; identity of unchanged sessions is preserved by App so this key is stable.
   const buildKey = $derived(related.map((id) => { const s = byKey.get(agent + '/' + id); return `${id}:${s?.ended ?? ''}:${s?.tool_calls ?? ''}` }).join('|'))
   let gen = 0
+  // subagent details by id; refetched only when that agent's ended/tool_calls (the buildKey parts) changed
+  const cache = new Map<string, { key: string; d: Promise<Detail | null> }>()
   $effect(() => {
     detail; buildKey
     untrack(build)
@@ -50,7 +52,17 @@
     const ids = related
     const my = ++gen
     Promise.all(
-      [...ids].map((id) => fetch(`/api/sessions/${agent}/${encodeURIComponent(id)}`).then((x) => (x.ok ? (x.json() as Promise<Detail>) : null)).catch(() => null)),
+      ids.map((id) => {
+        const s = byKey.get(agent + '/' + id)
+        const key = `${s?.ended ?? ''}:${s?.tool_calls ?? ''}`
+        const hit = cache.get(id)
+        if (hit?.key === key) return hit.d
+        const d = fetch(`/api/sessions/${agent}/${encodeURIComponent(id)}`).then((x) => (x.ok ? (x.json() as Promise<Detail>) : null)).catch(() => null)
+        cache.set(id, { key, d })
+        // don't pin a failed fetch: retry on the next build
+        d.then((v) => { if (!v && cache.get(id)?.d === d) cache.delete(id) })
+        return d
+      }),
     ).then((ds) => {
       if (my !== gen) return // superseded by a newer build
       const events = new Map<string, Event[]>([[rs.id, detail.events]])

@@ -30,9 +30,16 @@
     }
   })
 
+  let fullError = $state('')
   async function loadFull() {
-    const r = await fetch(`/api/sessions/${agent}/${encodeURIComponent(sessionId)}/events/${e.id}`)
-    full = ((await r.json()) as Event).text ?? ''
+    try {
+      const r = await fetch(`/api/sessions/${agent}/${encodeURIComponent(sessionId)}/events/${e.id}`)
+      if (!r.ok) throw new Error(String(r.status))
+      full = ((await r.json()) as Event).text ?? ''
+      fullError = ''
+    } catch (err) {
+      fullError = err instanceof Error ? err.message : String(err)
+    }
     open = true
   }
   function expand() {
@@ -65,7 +72,7 @@
     if (!rows.length) return { rows: 0, t: 'no rtk', title: 'rtk did not rewrite this command' }
     const saved = rows.reduce((a, r) => a + r.saved, 0)
     const title = rows.map((r) => `${r.rtk_cmd}: ${r.input} → ${r.output} tok  (${r.cmd})`).join('\n')
-    return { rows: rows.length, t: `rtk −${fmtNum(saved)} tok`, title }
+    return { rows: rows.length, t: `rtk ${fmtNum(-saved)} tok`, title }
   })
   const flags = $derived.by(() => {
     const m = e.meta ?? {}
@@ -82,7 +89,7 @@
   const otel = $derived.by(() => {
     if (!tele) return []
     const out: { t: string; title: string; err?: boolean }[] = []
-    if ('ttft_ms' in tele || 'cost_usd' in tele) {
+    if (e.kind !== 'tool_result') {
       const r = tele as TeleReq
       if (r.ttft_ms != null) out.push({ t: `ttft ${fmtMs(r.ttft_ms)}`, title: 'time to first token' })
       if (r.duration_ms != null) out.push({ t: fmtMs(r.duration_ms), title: 'api request duration' })
@@ -158,6 +165,7 @@
       </div>
       {#if e.truncated && full == null && open}
         <button class="sm" onclick={loadFull}>load full ({e.kind === 'tool_result' ? 'output' : 'text'} truncated)</button>
+        {#if fullError}<span style="color:var(--err)">failed to load: {fullError}</span>{/if}
       {/if}
     {/if}
     {#if showChild && child}

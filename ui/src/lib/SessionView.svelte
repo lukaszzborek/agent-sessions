@@ -9,7 +9,8 @@
 
   let { agent, id, byKey, depth, mode = $bindable('events') }: { agent: Agent; id: string; byKey: Map<string, Session>; depth: number; mode?: 'events' | 'flow' | 'stats' } = $props()
 
-  let detail = $state<Detail | null>(null)
+  // replaced wholesale on each load, never mutated: raw skips deep proxying of every event
+  let detail = $state.raw<Detail | null>(null)
   let tele = $state<Telemetry | null>(null)
   const s = $derived(detail?.summary)
   let error = $state('')
@@ -21,7 +22,7 @@
 
   async function editTags(edit: { add?: string[]; remove?: string[] }) {
     const r = await fetch(`/api/sessions/${agent}/${encodeURIComponent(id)}/tags`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(edit) })
-    if (r.ok && detail) detail.summary.tags = await r.json()
+    if (r.ok && detail) detail = { ...detail, summary: { ...detail.summary, tags: await r.json() } }
   }
 
   let root = $state<HTMLElement>()
@@ -30,6 +31,7 @@
     detail = null
     tele = null
     error = ''
+    teleAt = 0
     untrack(load)
   })
   // live update: refetch in place (keeps scroll/expanded state), follow tail if already at bottom
@@ -39,12 +41,13 @@
   })
   // one fetch in flight; ticks arriving meanwhile trigger a single trailing reload
   let busy = false, dirty = false
+  let teleAt = 0
   async function load() {
     if (busy) { dirty = true; return }
     busy = true
     try {
       const r = await fetch(`/api/sessions/${agent}/${encodeURIComponent(id)}`)
-      if (!r.ok) { error = String(r.status); return }
+      if (!r.ok) throw new Error(String(r.status))
       const d: Detail = await r.json()
       // reuse unchanged event objects so keyed EventCards don't re-render (no flicker of JSON views / nested sessions)
       if (detail) {
@@ -55,7 +58,12 @@
       const atBottom = sc && sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80
       detail = d
       if (atBottom && depth === 0) { await tick(); sc.scrollTop = sc.scrollHeight }
-      if (d.summary.agent === 'claude') loadTele()
+      error = ''
+      // server caches telemetry for 60s, so refetching on every live tick is wasted
+      if (d.summary.agent === 'claude' && Date.now() - teleAt > 60_000) { teleAt = Date.now(); loadTele() }
+    } catch (err) {
+      // a failed live reload keeps showing the last good detail
+      if (!detail) error = err instanceof Error ? err.message : String(err)
     } finally {
       busy = false
       if (dirty) { dirty = false; load() }
@@ -82,7 +90,12 @@
   })
   const hookMs = $derived(Object.values(tele?.hooks ?? {}).reduce((a, h) => a + h.total_ms, 0))
   const hookTitle = $derived(Object.entries(tele?.hooks ?? {}).map(([n, h]) => `${n}: ${h.count}× ${fmtMs(h.total_ms)}${h.blocking ? ` · ${h.blocking} blocking` : ''}${h.errors ? ` · ${h.errors} errors` : ''}`).join('\n'))
-  const isLive = $derived(s?.ended && Date.now() - new Date(s.ended).getTime() < 120_000)
+  let now = $state(Date.now())
+  $effect(() => {
+    const t = setInterval(() => (now = Date.now()), 30_000)
+    return () => clearInterval(t)
+  })
+  const isLive = $derived(s?.ended && now - new Date(s.ended).getTime() < 120_000)
 
   const kinds: { k: Kind; label: string; color: string }[] = [
     { k: 'user', label: 'user', color: 'var(--user)' },
@@ -116,12 +129,19 @@
       return true
     })
   })
+  // render only the tail of long sessions; older events load on demand
+  let limit = $state(300)
   const parent = $derived(s?.parent_id ? byKey.get(s.agent + '/' + s.parent_id) : undefined)
   // this session plus its subagents (recursively), for the stats tab
   const scope = $derived.by(() => {
     if (!s) return []
     const out: Session[] = []
+    // claude lists nested subagents on both the root and their spawner, so dedupe or stats double-count
+    const seen = new Set<string>()
     const walk = (x: Session) => {
+      const k = x.agent + '/' + x.id
+      if (seen.has(k)) return
+      seen.add(k)
       out.push(x)
       for (const cid of x.children) {
         const c = byKey.get(x.agent + '/' + cid)
@@ -161,7 +181,7 @@
       <span class="muted">Σ {fmtNum(totalTokens(s.usage))}</span>
       {#if s.max_context}<span title="peak context: prompt tokens of the largest single API call{s.context_window ? ` (window ${fmtNum(s.context_window)})` : ''}">ctx {fmtNum(s.max_context)}{#if s.context_window} / {fmtNum(s.context_window)} ({Math.round((100 * s.max_context) / s.context_window)}%){/if}</span>{/if}
       {#if s.cost != null}<span class="muted" title="API list price equivalent (subscription plans bill differently)">{fmtCost(s.cost)}</span>{/if}
-      {#if rtk}<span title="rtk history: rewritten shell calls / all shell calls · tokens rtk claims it filtered out of {fmtNum(rtk.input)} raw">rtk {rtk.hit}/{rtk.calls} calls · −{fmtNum(rtk.saved)} tok</span>{/if}
+      {#if rtk}<span title="rtk history: rewritten shell calls / all shell calls · tokens rtk claims it filtered out of {fmtNum(rtk.input)} raw">rtk {rtk.hit}/{rtk.calls} calls · {fmtNum(-rtk.saved)} tok</span>{/if}
     </div>
     <div class="row tags">
       {#each s.tags as t}
@@ -218,7 +238,10 @@
     <Flow {detail} {byKey} />
   {:else}
     <div class="events">
-      {#each visible as e (e.id)}
+      {#if visible.length > limit}
+        <button class="more" onclick={() => (limit += 300)}>show {Math.min(300, visible.length - limit)} earlier ({visible.length - limit} hidden)</button>
+      {/if}
+      {#each visible.slice(-limit) as e (e.id)}
         <EventCard {e} call={e.kind === 'tool_result' ? calls.get(e.tool_call_id ?? '') : undefined} tele={e.request_id ? (firstOfReq.has(e.id) ? tele?.requests[e.request_id] : undefined) : e.kind === 'tool_result' && e.tool_call_id ? tele?.tools[e.tool_call_id] : undefined} {agent} sessionId={id} {byKey} {depth} />
       {/each}
     </div>
@@ -245,6 +268,7 @@
   .filters button.on { background: var(--bg3); color: var(--fg); border-color: var(--line); }
   .filters button.on i { opacity: 1; }
   .filters button:not(.on) { color: var(--fg3); }
+  .more { display: block; margin: 6px auto; font-size: 11px; }
   .events { padding: 8px 16px 40px; }
   .seg { display: inline-flex; }
   .seg button { border-radius: 0; font-size: 11px; }

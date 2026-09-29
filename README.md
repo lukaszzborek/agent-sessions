@@ -69,10 +69,11 @@ Tokens and cost are attributed per API call, so a session that switched models i
 
 ## Storage and live updates
 
-DB: `~/.local/share/agent-sessions/sessions.db`. Each source file is stored zstd-compressed with its parsed summary, keyed by path + mtime + size.
+DB: `sessions.db` in the OS data dir (`~/.local/share/agent-sessions/` on Linux, `~/Library/Application Support/agent-sessions/` on macOS,
+`%APPDATA%\agent-sessions\` on Windows); the exact path is printed at startup. Each source file is stored zstd-compressed with its parsed summary, keyed by path + mtime + size.
 Files deleted on disk stay in the DB, marked archived; the detail view falls back to the stored copy. `↻` rescans.
 
-Data dir was renamed from `ai-sessions` to `agent-sessions`; on first run after upgrading, an old `~/.local/share/ai-sessions` is
+Data dir was renamed from `ai-sessions` to `agent-sessions`; on first run after upgrading, an old `ai-sessions` dir next to it is
 moved automatically. The config file moved too (`ai-sessions/config.json` -> `agent-sessions/config.toml`) but the format changed,
 so it is not auto-converted - a startup message flags an old config.json left behind.
 
@@ -82,7 +83,8 @@ Every 10 min a background pass stores telemetry and rtk history for the sessions
 
 ## Config
 
-`~/.config/agent-sessions/config.toml`, all keys optional. Read once at startup; on a parse error the error is logged and defaults are used.
+`config.toml` in the OS config dir (`~/.config/agent-sessions/` on Linux, `~/Library/Application Support/agent-sessions/` on macOS,
+`%APPDATA%\agent-sessions\` on Windows; printed at startup), all keys optional. Read once at startup; on a parse error the error is logged and defaults are used.
 
 ```toml
 [telemetry]
@@ -148,7 +150,7 @@ with per-group medians and Δ vs the first group. Conventions it understands:
 ### Prices
 
 Costs use a built-in USD-per-1M-token table (`server/src/pricing.rs`). Add models or override prices in
-`~/.config/agent-sessions/prices.toml` - kept apart from `config.toml` so it can be shared as is:
+`prices.toml` in the same dir as `config.toml` - kept apart from `config.toml` so it can be shared as is:
 
 ```toml
 # DeepSeek list prices, 2026-09

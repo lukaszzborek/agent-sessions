@@ -103,6 +103,17 @@
   function dayOf(s?: string) {
     return s ? new Date(s).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) : 'unknown'
   }
+  // compared against the previous top-level row: nested subagents can start on another day than their parent
+  const dayHeaders = $derived.by(() => {
+    let last: string | null = null
+    return filtered.map(({ s, depth }) => {
+      if (depth) return null
+      const d = dayOf(s.started)
+      if (d === last) return null
+      last = d
+      return d
+    })
+  })
 </script>
 
 <div class="filters">
@@ -141,10 +152,11 @@
       {#each hooks as h}<option value={h}>{shortHook(h)}</option>{/each}
     </select>
   </div>
-  {#if tags.length}
+  {#if tags.length || tagFilter.tag}
     <div class="row">
       <select bind:value={tagFilter.tag} style="flex:1;min-width:0">
         <option value="">all tags</option>
+        {#if tagFilter.tag && !tags.includes(tagFilter.tag)}<option value={tagFilter.tag}>{tagFilter.tag}</option>{/if}
         {#each tags as t}<option value={t}>{t}</option>{/each}
       </select>
       {#if tagFilter.tag}<a class="dim" href="#/compare/{encodeURIComponent(tagFilter.tag)}" title="side-by-side table of sessions with this tag">compare</a>{/if}
@@ -155,11 +167,9 @@
 
 <ul>
   {#each filtered.slice(0, limit) as { s, depth, nkids }, i (s.agent + s.id)}
-    {@const prevDay = i > 0 ? dayOf(filtered[i - 1].s.started) : null}
-    {@const day = depth ? prevDay : dayOf(s.started)}
     {@const k = s.agent + s.id}
     {@const tot = totals.get(k)}
-    {#if day !== prevDay}<li class="day dim">{day}</li>{/if}
+    {#if dayHeaders[i]}<li class="day dim">{dayHeaders[i]}</li>{/if}
     <li class:sel={selected?.agent === s.agent && selected?.id === s.id} class:sub={depth > 0}>
       <a href="#/s/{s.agent}/{encodeURIComponent(s.id)}" style:padding-left={depth ? `${12 + 14 * depth}px` : null}>
         <div class="row top">

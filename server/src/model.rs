@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -132,10 +132,16 @@ fn user_source() -> String {
     crate::config::USER_SOURCE.into()
 }
 
+/// A non-UTF-8 path would otherwise fail the serialization of the whole session list.
+fn path_lossy<S: serde::Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&p.to_string_lossy())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub agent: Agent,
     pub id: String,
+    #[serde(serialize_with = "path_lossy")]
     pub path: PathBuf,
     pub cwd: String,
     pub title: String,
@@ -199,6 +205,15 @@ pub struct SessionSummary {
     /// correctly.
     #[serde(default)]
     pub buckets: Vec<Bucket>,
+    /// Claude: ids of the API requests counted in `usage`. Stored so the indexer can find requests
+    /// a forked/continued session copied from an earlier file; emptied once it has, so it never
+    /// reaches the API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_ids: Vec<String>,
+    /// Claude: request ids also present in an earlier-started file; their usage is not counted
+    /// here. Set by the indexer only, never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dup_request_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

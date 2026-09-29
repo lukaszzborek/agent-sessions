@@ -15,11 +15,12 @@ export interface Session {
 }
 export interface Detail { summary: Session; events: Event[] }
 // Claude OTel enrichment (Loki events + Prometheus counters); null when not configured or nothing recorded
-export interface TeleReq { ttft_ms?: number; duration_ms?: number; cost_usd?: number; effort?: string; speed?: string }
-export interface TeleTool { duration_ms?: number; success?: boolean; input_bytes?: number; result_bytes?: number; decision?: string; decision_source?: string }
+// server serializes absent optional fields as null (not omitted)
+export interface TeleReq { ttft_ms: number | null; duration_ms: number | null; cost_usd: number | null; effort: string | null; speed: string | null }
+export interface TeleTool { duration_ms: number | null; success: boolean | null; input_bytes: number | null; result_bytes: number | null; decision: string | null; decision_source: string | null }
 export interface Telemetry {
   requests: Record<string, TeleReq>; tools: Record<string, TeleTool>
   hooks: Record<string, { count: number; total_ms: number; blocking: number; errors: number }>
-  cost_usd?: number; api_requests: number; active_cli_s?: number; active_user_s?: number
-  loc_added?: number; loc_removed?: number; commits?: number; prs?: number; start_type?: string
+  cost_usd: number | null; api_requests: number; active_cli_s: number | null; active_user_s: number | null
+  loc_added: number | null; loc_removed: number | null; commits: number | null; prs: number | null; start_type: string | null
 }

@@ -7,7 +7,7 @@
   import { live } from './lib/live.svelte'
   import { sourceFilter } from './lib/sources.svelte'
 
-  let sessions = $state<Session[]>([])
+  let sessions = $state.raw<Session[]>([])
   let loading = $state(true)
   let route = $state(location.hash)
   let listWidth = $state(380)
@@ -18,20 +18,36 @@
   const sources = $derived([...new Set(sessions.map((s) => s.source))].sort((a, b) => +(b === 'user') - +(a === 'user') || a.localeCompare(b)))
   const byKey = $derived(new Map(sessions.map((s) => [s.agent + '/' + s.id, s])))
 
-  // keep object identity for unchanged sessions so downstream $derived/props don't re-run on every push
-  async function load() {
+  // keep object identity for unchanged sessions so downstream $derived/props don't re-run on every push.
+  // `changed` = keys the server reported; only those are deep-compared, the rest are reused as-is.
+  // Only the newest request applies its result, so a slow older response can't overwrite a newer one.
+  // A full load superseded by a partial one leaves `fullPending` set, so the partial that applies does the full compare.
+  let loadGen = 0
+  let fullPending = false
+  async function load(changed?: Set<string>) {
+    const my = ++loadGen
+    if (!changed) fullPending = true
     loading = true
-    const fresh: Session[] = await (await fetch('/api/sessions')).json()
-    const old = new Map(sessions.map((s) => [s.agent + '/' + s.id, s]))
-    sessions = fresh.map((s) => {
-      const o = old.get(s.agent + '/' + s.id)
-      return o && JSON.stringify(o) === JSON.stringify(s) ? o : s
-    })
-    loading = false
+    try {
+      const r = await fetch('/api/sessions')
+      if (!r.ok) throw new Error(String(r.status))
+      const fresh: Session[] = await r.json()
+      if (my !== loadGen) return
+      const keys = fullPending ? undefined : changed
+      fullPending = false
+      const old = new Map(sessions.map((s) => [s.agent + '/' + s.id, s]))
+      sessions = fresh.map((s) => {
+        const k = s.agent + '/' + s.id
+        const o = old.get(k)
+        return o && ((keys && !keys.has(k)) || JSON.stringify(o) === JSON.stringify(s)) ? o : s
+      })
+    } finally {
+      if (my === loadGen) loading = false
+    }
   }
   async function refresh() {
     loading = true
-    await fetch('/api/refresh', { method: 'POST' })
+    await fetch('/api/refresh', { method: 'POST' }).catch(() => {})
     await load()
   }
   load()
@@ -42,27 +58,39 @@
   const es = new EventSource('/api/watch')
   let pending: string[] = []
   let pulling = false
+  let opened = false
+  // events pushed while the stream was down are lost: resync the list and the open session
+  es.onopen = async () => {
+    if (!opened) { opened = true; return }
+    await load()
+    if (sel) live.tick[sel.agent + '/' + sel.id] = (live.tick[sel.agent + '/' + sel.id] ?? 0) + 1
+  }
   es.onmessage = (m) => {
     pending.push(...(JSON.parse(m.data) as string[]))
     if (!pulling) pull()
   }
   async function pull() {
     pulling = true
-    while (pending.length) {
-      const keys = pending
-      pending = []
-      await load()
-      for (const k of keys) live.tick[k] = (live.tick[k] ?? 0) + 1
+    try {
+      while (pending.length) {
+        const keys = pending
+        pending = []
+        await load(new Set(keys))
+        for (const k of keys) live.tick[k] = (live.tick[k] ?? 0) + 1
+      }
+    } finally {
+      pulling = false
     }
-    pulling = false
   }
 
+  // a hand-edited hash can be malformed; fall back to the raw text instead of throwing inside $derived
+  const decode = (s: string) => { try { return decodeURIComponent(s) } catch { return s } }
   const sel = $derived.by(() => {
     const m = route.match(/^#\/s\/(\w+)\/([^/]+)/)
-    return m ? { agent: m[1] as Session['agent'], id: decodeURIComponent(m[2]) } : null
+    return m ? { agent: m[1] as Session['agent'], id: decode(m[2]) } : null
   })
   const view = $derived(route.startsWith('#/stats') ? 'stats' : route.startsWith('#/compare') ? 'compare' : 'session')
-  const compareTag = $derived(decodeURIComponent(route.match(/^#\/compare\/([^/]+)/)?.[1] ?? ''))
+  const compareTag = $derived(decode(route.match(/^#\/compare\/([^/]+)/)?.[1] ?? ''))
 
   // drag resize
   function startDrag(e: MouseEvent) {

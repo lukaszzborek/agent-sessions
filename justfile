@@ -1,6 +1,6 @@
 # build UI then embed into release binary
 build:
-    cd ui && npm install --no-audit --no-fund && npm run build
+    cd ui && npm ci --no-audit --no-fund && npm run build
     cd server && cargo build --release
 
 run: build
