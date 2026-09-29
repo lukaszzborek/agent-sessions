@@ -13,14 +13,26 @@ Local web UI over coding-agent session logs (Claude Code, Codex, Pi). Sessions a
 
 ## Run
 
+Download the archive for your platform from [Releases](https://github.com/lukaszzborek/agent-sessions/releases/latest)
+(Linux x86_64 / arm64, macOS Apple Silicon / Intel, Windows x86_64), unpack it and run the binary. Nothing else needed, the UI is embedded.
+
+```bash
+tar xzf agent-sessions-*-x86_64-unknown-linux-gnu.tar.gz && cd agent-sessions-*/
+./agent-sessions              # serves http://127.0.0.1:7777
+PORT=8000 ./agent-sessions    # other port
+./agent-sessions --open       # also opens the browser (Windows browser on WSL)
+```
+
+macOS binaries are not signed, so Gatekeeper blocks the first run: `xattr -d com.apple.quarantine ./agent-sessions`.
+
+### From source
+
 ```bash
 git clone https://github.com/lukaszzborek/agent-sessions.git && cd agent-sessions
 just run                                          # builds ui + release binary, serves http://127.0.0.1:7777
-PORT=8000 ./server/target/release/agent-sessions  # other port
-./server/target/release/agent-sessions --open     # also opens the browser (Windows browser on WSL)
 ```
 
-Needs `just`, `npm` and `cargo`. The UI is embedded into the binary, so the release binary is all you need afterwards.
+Needs `just`, `npm` and `cargo`. The binary lands in `server/target/release/agent-sessions`.
 
 Everything stays local: the server binds to `127.0.0.1` only and has no auth, and nothing is sent anywhere
 (the optional [telemetry](#telemetry) integration only reads from your own Loki / Prometheus).
@@ -205,6 +217,12 @@ just dev-ui              # vite dev server, proxies /api to :7777
 | `POST /api/sessions/:agent/:id/tags` | `{"add":[…],"remove":[…]}` |
 | `POST /api/refresh` | rescan |
 | `GET /api/watch` | SSE, `["agent/id", …]` per change |
+
+### Release
+
+Bump `version` in `server/Cargo.toml`, run `cargo build` so `Cargo.lock` follows (CI builds with `--locked`), commit both, then `git tag vX.Y.Z && git push --tags`.
+`.github/workflows/release.yml` builds the UI once, builds the binary for every target and attaches the archives + `SHA256SUMS` to a GitHub release.
+Run it by hand (`workflow_dispatch`) to get the archives as workflow artifacts without publishing a release.
 
 ## License
 
