@@ -16,6 +16,7 @@
   let metric = $state<Metric>('cost')
   let selDay = $state<string | null>(null)
   let hoverDay = $state<string | null>(null)
+  let tipX = $state(0)
 
   // one row per session × local day × model
   interface Row { day: string; s: Session; model: string; tools: number; input: number; cache: number; output: number; cost: number }
@@ -100,7 +101,6 @@
   })
   const maxDay = $derived(Math.max(1e-9, ...days.map((d) => d.total)))
   const tip = $derived(days.find((d) => d.day === hoverDay))
-  const tipPos = $derived((100 * (days.findIndex((d) => d.day === hoverDay) + 0.5)) / Math.max(1, days.length))
 
   $effect(() => { if (selDay && !days.some((d) => d.day === selDay)) selDay = null })
   const focus = $derived(selDay ? rows.filter((r) => r.day === selDay) : rows)
@@ -185,13 +185,13 @@
       <div class="bars" onmouseleave={() => (hoverDay = null)} role="presentation">
         {#each days as d (d.day)}
           <button class="col" class:sel={selDay === d.day} class:fade={selDay && selDay !== d.day} aria-label={d.day}
-            onmouseenter={() => (hoverDay = d.day)} onclick={() => (selDay = selDay === d.day ? null : d.day)}>
+            onmouseenter={(e) => { hoverDay = d.day; tipX = e.currentTarget.offsetLeft + e.currentTarget.offsetWidth / 2 }} onclick={() => (selDay = selDay === d.day ? null : d.day)}>
             {#each d.segs as g}<i style="height:{(100 * g.v) / maxDay}%;background:{colorOf.get(g.key) ?? OTHER}"></i>{/each}
           </button>
         {/each}
       </div>
       {#if tip}
-        <div class="tip" style="left:clamp(90px, {tipPos}%, calc(100% - 90px))">
+        <div class="tip" style="left:clamp(90px, {tipX}px, calc(100% - 90px))">
           <b>{fmtDay(tip.day)}</b><b class="r">{fmtVal(tip.total)}</b>
           {#each tip.segs as g}
             <span><i style="background:{colorOf.get(g.key) ?? OTHER}"></i>{g.key}</span><span class="r">{fmtVal(g.v)}</span>
