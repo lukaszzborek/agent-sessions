@@ -17,7 +17,10 @@ walkdir = "2"
 dirs = "7"
 anyhow = "1"
 tower-http = { version = "0.7", features = ["compression-gzip"] }
+# only for reading rtk's history.db: turso locks a file exclusively, which would block rtk writing it
 rusqlite = { version = "0.40", features = ["bundled"] }
+turso = { version = "0.8.1", default-features = false }
+pollster = "0.4"
 zstd = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

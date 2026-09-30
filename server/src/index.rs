@@ -4,11 +4,11 @@ use crate::model::*;
 use crate::parsers;
 use anyhow::Context;
 use rayon::prelude::*;
-use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::UNIX_EPOCH;
+use turso::Connection;
 use walkdir::WalkDir;
 
 /// Bump when SessionSummary gains fields so stale DB rows get reparsed from stored raw.
@@ -412,7 +412,7 @@ pub fn build(
         .collect();
     let guard = lock(conn);
     let tx: &Connection = &guard;
-    db::warn("begin", tx.execute_batch("BEGIN"));
+    db::begin(tx);
     for (path, o, source, auto) in results {
         match o {
             Outcome::Keep(mut s) => {
@@ -467,7 +467,7 @@ pub fn build(
             }
         }
     }
-    db::warn("commit", tx.execute_batch("COMMIT"));
+    db::commit(tx);
     let manual = db::load_tags(tx);
     drop(guard);
     for s in sessions.iter_mut() {

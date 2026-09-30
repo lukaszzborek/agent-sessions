@@ -72,6 +72,9 @@ Tokens and cost are attributed per API call, so a session that switched models i
 DB: `sessions.db` in the OS data dir (`~/.local/share/agent-sessions/` on Linux, `~/Library/Application Support/agent-sessions/` on macOS,
 `%APPDATA%\agent-sessions\` on Windows); the exact path is printed at startup. Each source file is stored zstd-compressed with its parsed summary, keyed by path + mtime + size.
 Files deleted on disk stay in the DB, marked archived; the detail view falls back to the stored copy. `↻` rescans.
+The DB is a SQLite-format file written by [Turso](https://github.com/tursodatabase/turso), which locks it while the server runs:
+one instance per data dir (a second one on another `PORT` fails with a locking error), and `sqlite3 sessions.db` works only
+while the server is stopped.
 
 Data dir was renamed from `ai-sessions` to `agent-sessions`; on first run after upgrading, an old `ai-sessions` dir next to it is
 moved automatically. The config file moved too (`ai-sessions/config.json` -> `agent-sessions/config.toml`) but the format changed,
@@ -200,7 +203,7 @@ just dev-ui              # vite dev server, proxies /api to :7777
 | `server/src/index.rs` | source discovery, parallel parse, DB sync, parent/child linking, meta tags |
 | `server/src/parsers/{claude,codex,pi}.rs` | log format -> normalized `Event` list |
 | `server/src/model.rs` | `SessionSummary`, `Event`, `Usage` |
-| `server/src/db.rs` | SQLite store (raw blob + summary per file, tags, telemetry, rtk) |
+| `server/src/db.rs` | Turso (SQLite-format) store (raw blob + summary per file, tags, telemetry, rtk) |
 | `server/src/config.rs` | config file + `Source` definition |
 | `server/src/pricing.rs` | price table + `prices.toml` |
 | `server/src/extensions/{telemetry,rtk}.rs` | optional per-session enrichment |

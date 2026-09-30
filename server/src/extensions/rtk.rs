@@ -3,9 +3,10 @@
 //! The history is copied into our db per session, so it survives the trial dir being deleted.
 
 use crate::model::{is_shell_tool, Event, EventKind};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 use serde_json::{json, Value};
 use std::path::Path;
+use turso::Connection;
 
 /// Sets `meta.rtk` on every shell tool call: the rtk rows it produced, or `[]` when rtk left it
 /// alone.
@@ -96,7 +97,7 @@ pub fn snapshot(conn: &Connection, trial: &Path, session: &Path) -> Option<Vec<(
 }
 
 fn rows(db: &Path) -> Option<Vec<(String, Value)>> {
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = rusqlite::Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let mut stmt = conn
         .prepare("select timestamp, original_cmd, rtk_cmd, input_tokens, output_tokens, saved_tokens, exec_time_ms from commands order by id")
         .ok()?;

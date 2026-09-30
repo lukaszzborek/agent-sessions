@@ -43,7 +43,7 @@ struct ParsedCache {
 struct AppState {
     roots: Roots,
     index: RwLock<Index>,
-    db: Mutex<rusqlite::Connection>,
+    db: Mutex<turso::Connection>,
     /// Mirror of the db's `sessions` table, so a build does not reload every summary. The lock
     /// also serializes index builds.
     rows: tokio::sync::Mutex<HashMap<PathBuf, db::Row>>,
@@ -57,7 +57,7 @@ struct AppState {
 
 impl AppState {
     // A poisoned lock only means another request panicked mid-access; the data is still usable.
-    fn db(&self) -> MutexGuard<'_, rusqlite::Connection> {
+    fn db(&self) -> MutexGuard<'_, turso::Connection> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -138,6 +138,23 @@ fn is_local_request(headers: &header::HeaderMap) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Bound before the db opens: a second instance on the same port should get the bind hint, not
+    // the db lock error.
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "cannot bind {}: {} (another instance running? set PORT=...)",
+                addr, e
+            );
+            std::process::exit(1);
+        }
+    };
     let roots = Roots::default_roots()?;
     let db = Mutex::new(db::open(&roots.db_file)?);
     eprintln!("db: {}", roots.db_file.display());
@@ -165,10 +182,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(watch_files(state.clone()));
     tokio::spawn(sync_external(state.clone()));
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(7777);
     let app = Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{agent}/{id}", get(get_session))
@@ -181,18 +194,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(axum::middleware::from_fn(local_host_only))
         .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state);
-    let addr = format!("127.0.0.1:{}", port);
     eprintln!("listening on http://{}", addr);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "cannot bind {}: {} (another instance running? set PORT=...)",
-                addr, e
-            );
-            std::process::exit(1);
-        }
-    };
     if std::env::args().any(|a| a == "--open") {
         open_browser(&format!("http://{}", addr));
     }

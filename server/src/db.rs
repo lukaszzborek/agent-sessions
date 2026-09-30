@@ -1,8 +1,9 @@
 use crate::model::{Agent, SessionSummary};
 use anyhow::Context;
-use rusqlite::{params, Connection, OptionalExtension};
+use pollster::block_on;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use turso::{params, Builder, Connection, IntoParams};
 
 #[derive(Debug)]
 pub struct Row {
@@ -13,6 +14,49 @@ pub struct Row {
     pub summary: SessionSummary,
 }
 
+// Turso's API is async but its default IO completes inline, so callers stay sync (rayon workers,
+// spawn_blocking) by blocking on each call instead of threading async through the index.
+fn execute(c: &Connection, sql: &str, params: impl IntoParams) -> turso::Result<u64> {
+    block_on(c.execute(sql, params))
+}
+
+/// Rows that fail to map are skipped; a failed row read ends the result early instead of failing
+/// it, so a damaged db still loads what it can.
+fn query_map<T>(
+    c: &Connection,
+    sql: &str,
+    params: impl IntoParams,
+    f: impl Fn(&turso::Row) -> Option<T>,
+) -> turso::Result<Vec<T>> {
+    block_on(async {
+        let mut rows = c.query(sql, params).await?;
+        let mut out = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(r)) => out.extend(f(&r)),
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("db: reading rows of `{sql}` stopped: {e}");
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+fn query_row<T>(
+    c: &Connection,
+    sql: &str,
+    params: impl IntoParams,
+    f: impl Fn(&turso::Row) -> turso::Result<T>,
+) -> turso::Result<Option<T>> {
+    block_on(async {
+        let mut rows = c.query(sql, params).await?;
+        rows.next().await?.map(|r| f(&r)).transpose()
+    })
+}
+
 /// Opens the db file, creating it and the schema when missing.
 ///
 /// # Errors
@@ -21,10 +65,15 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
     }
-    let c = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
-    c.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS sessions (
+    let name = path
+        .to_str()
+        .with_context(|| format!("db path is not UTF-8: {}", path.display()))?;
+    let c = block_on(Builder::new_local(name).build())
+        .and_then(|db| db.connect())
+        .with_context(|| format!("open {}", path.display()))?;
+    // No journal_mode pragma: Turso is WAL-only and its execute_batch rejects the row it returns.
+    block_on(c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions (
             path TEXT PRIMARY KEY,
             agent TEXT NOT NULL,
             mtime INTEGER NOT NULL,
@@ -48,7 +97,7 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
             path TEXT PRIMARY KEY,
             rows TEXT NOT NULL
          );",
-    )
+    ))
     .context("init schema")?;
     migrate_subagent_ids(&c);
     Ok(c)
@@ -58,16 +107,16 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
 /// telemetry stored under the old id. A copied subagent file exists under several parents, so the
 /// row is copied to each new id before the old one is dropped. Finds nothing once migrated.
 fn migrate_subagent_ids(c: &Connection) {
-    let Ok(mut st) = c.prepare("SELECT path FROM sessions WHERE path LIKE '%subagents%'") else {
+    let Ok(paths) = query_map(
+        c,
+        "SELECT path FROM sessions WHERE path LIKE '%subagents%'",
+        (),
+        |r| r.get::<String>(0).ok(),
+    ) else {
         return;
     };
     let mut new_ids: HashMap<String, Vec<String>> = HashMap::new();
-    for path in st
-        .query_map([], |r| r.get::<_, String>(0))
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
+    for path in paths {
         let path = Path::new(&path);
         let name = |p: Option<&Path>| p?.file_name()?.to_str().map(str::to_string);
         let dir = path.parent();
@@ -89,74 +138,79 @@ fn migrate_subagent_ids(c: &Connection) {
         for new in news {
             warn(
                 "migrate tags",
-                c.execute(
+                execute(
+                    c,
                     "INSERT OR IGNORE INTO tags (agent, id, tags) SELECT agent, ?1, tags FROM tags WHERE agent=?2 AND id=?3",
-                    params![new, claude, aid],
+                    params![new.as_str(), claude, aid.as_str()],
                 ),
             );
             warn(
                 "migrate telemetry",
-                c.execute(
+                execute(
+                    c,
                     "INSERT OR IGNORE INTO telemetry (id, fetched, data) SELECT ?1, fetched, data FROM telemetry WHERE id=?2",
-                    params![new, aid],
+                    params![new.as_str(), aid.as_str()],
                 ),
             );
         }
         warn(
             "migrate tags",
-            c.execute(
+            execute(
+                c,
                 "DELETE FROM tags WHERE agent=?1 AND id=?2",
-                params![claude, aid],
+                params![claude, aid.as_str()],
             ),
         );
         warn(
             "migrate telemetry",
-            c.execute("DELETE FROM telemetry WHERE id=?1", params![aid]),
+            execute(
+                c,
+                "DELETE FROM telemetry WHERE id=?1",
+                params![aid.as_str()],
+            ),
         );
     }
 }
 
 pub fn load_all(c: &Connection) -> HashMap<PathBuf, Row> {
-    let mut st = c
-        .prepare("SELECT path, agent, mtime, size, version, summary FROM sessions")
-        .expect("static SQL matches the schema from open()");
-    st.query_map([], |r| {
-        let path: String = r.get(0)?;
-        let agent: String = r.get(1)?;
-        let summary: String = r.get(5)?;
-        Ok((
-            path,
-            agent,
-            r.get::<_, i64>(2)?,
-            r.get::<_, i64>(3)?,
-            r.get::<_, i64>(4)?,
-            summary,
-        ))
-    })
-    .expect("query takes no parameters")
-    .filter_map(|r| r.ok())
-    .filter_map(|(path, agent, mtime, size, version, summary)| {
-        let agent = Agent::parse(&agent)?;
-        let summary = serde_json::from_str(&summary).ok()?;
-        Some((
-            PathBuf::from(path),
-            Row {
-                agent,
-                mtime: mtime as u64,
-                size: size as u64,
-                version: version as u32,
-                summary,
-            },
-        ))
-    })
+    query_map(
+        c,
+        "SELECT path, agent, mtime, size, version, summary FROM sessions",
+        (),
+        |r| {
+            let agent = Agent::parse(&r.get::<String>(1).ok()?)?;
+            let summary = serde_json::from_str(&r.get::<String>(5).ok()?).ok()?;
+            Some((
+                PathBuf::from(r.get::<String>(0).ok()?),
+                Row {
+                    agent,
+                    mtime: r.get::<i64>(2).ok()? as u64,
+                    size: r.get::<i64>(3).ok()? as u64,
+                    version: r.get::<i64>(4).ok()? as u32,
+                    summary,
+                },
+            ))
+        },
+    )
+    .expect("static SQL matches the schema from open()")
+    .into_iter()
     .collect()
 }
 
 /// Logs a failed write; the index still serves from memory, but the change is lost on restart.
-pub fn warn<T>(what: &str, r: rusqlite::Result<T>) {
+pub fn warn<T>(what: &str, r: turso::Result<T>) {
     if let Err(e) = r {
         eprintln!("db: {what} failed: {e}");
     }
+}
+
+/// Starts the transaction that batches an index build's writes; ended by [`commit`].
+pub fn begin(c: &Connection) {
+    warn("begin", block_on(c.execute_batch("BEGIN")));
+}
+
+pub fn commit(c: &Connection) {
+    warn("commit", block_on(c.execute_batch("COMMIT")));
 }
 
 /// zstd blob as stored in `sessions.raw`; done by the caller so it can run off the db lock.
@@ -166,10 +220,11 @@ pub fn compress(raw: &[u8]) -> Vec<u8> {
 
 /// Insert or replace full row; `blob` is `compress`ed raw. False when the write failed.
 pub fn upsert(c: &Connection, path: &Path, row: &Row, blob: &[u8]) -> bool {
-    let r = c.execute(
+    let r = execute(
+        c,
         "INSERT OR REPLACE INTO sessions (path, agent, mtime, size, version, summary, raw) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
-            path.to_string_lossy(),
+            &*path.to_string_lossy(),
             row.agent.as_str(),
             row.mtime as i64,
             row.size as i64,
@@ -187,44 +242,38 @@ pub fn upsert(c: &Connection, path: &Path, row: &Row, blob: &[u8]) -> bool {
 pub fn update_summary(c: &Connection, path: &Path, version: u32, summary: &SessionSummary) {
     warn(
         "update session summary",
-        c.execute(
+        execute(
+            c,
             "UPDATE sessions SET version=?1, summary=?2 WHERE path=?3",
             params![
                 version as i64,
                 serde_json::to_string(summary).unwrap_or_default(),
-                path.to_string_lossy()
+                &*path.to_string_lossy()
             ],
         ),
     );
 }
 
 pub fn raw(c: &Connection, path: &Path) -> Option<Vec<u8>> {
-    let blob: Vec<u8> = c
-        .query_row(
-            "SELECT raw FROM sessions WHERE path=?1",
-            params![path.to_string_lossy()],
-            |r| r.get(0),
-        )
-        .optional()
-        .ok()??;
+    let blob: Vec<u8> = query_row(
+        c,
+        "SELECT raw FROM sessions WHERE path=?1",
+        params![&*path.to_string_lossy()],
+        |r| r.get(0),
+    )
+    .ok()??;
     zstd::decode_all(&blob[..]).ok()
 }
 
 /// User-set tags per (agent, session id).
 pub fn load_tags(c: &Connection) -> HashMap<(Agent, String), Vec<String>> {
-    let mut st = c
-        .prepare("SELECT agent, id, tags FROM tags")
-        .expect("static SQL matches the schema from open()");
-    st.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
+    query_map(c, "SELECT agent, id, tags FROM tags", (), |r| {
+        let agent = Agent::parse(&r.get::<String>(0).ok()?)?;
+        let tags = serde_json::from_str(&r.get::<String>(2).ok()?).ok()?;
+        Some(((agent, r.get::<String>(1).ok()?), tags))
     })
-    .expect("query takes no parameters")
-    .filter_map(|r| r.ok())
-    .filter_map(|(a, id, t)| Some(((Agent::parse(&a)?, id), serde_json::from_str(&t).ok()?)))
+    .expect("static SQL matches the schema from open()")
+    .into_iter()
     .collect()
 }
 
@@ -232,7 +281,8 @@ pub fn set_tags(c: &Connection, agent: Agent, id: &str, tags: &[String]) {
     if tags.is_empty() {
         warn(
             "delete tags",
-            c.execute(
+            execute(
+                c,
                 "DELETE FROM tags WHERE agent=?1 AND id=?2",
                 params![agent.as_str(), id],
             ),
@@ -240,7 +290,8 @@ pub fn set_tags(c: &Connection, agent: Agent, id: &str, tags: &[String]) {
     } else {
         warn(
             "save tags",
-            c.execute(
+            execute(
+                c,
                 "INSERT OR REPLACE INTO tags (agent, id, tags) VALUES (?1,?2,?3)",
                 params![
                     agent.as_str(),
@@ -255,12 +306,12 @@ pub fn set_tags(c: &Connection, agent: Agent, id: &str, tags: &[String]) {
 /// Stored OTel telemetry JSON of a Claude session (`null` = nothing was recorded) and when it was
 /// fetched (unix s).
 pub fn telemetry(c: &Connection, id: &str) -> Option<(u64, String)> {
-    c.query_row(
+    query_row(
+        c,
         "SELECT fetched, data FROM telemetry WHERE id=?1",
         params![id],
-        |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+        |r| Ok((r.get::<i64>(0)? as u64, r.get(1)?)),
     )
-    .optional()
     .ok()?
 }
 
@@ -268,7 +319,8 @@ pub fn save_telemetry(c: &Connection, id: &str, fetched: u64, data: &str) {
     // A later `null` means the backends' retention ran out, not that the stored data was wrong.
     warn(
         "save telemetry",
-        c.execute(
+        execute(
+            c,
             "INSERT INTO telemetry (id, fetched, data) VALUES (?1,?2,?3)
          ON CONFLICT(id) DO UPDATE SET fetched=excluded.fetched, data=CASE WHEN excluded.data='null' THEN data ELSE excluded.data END",
             params![id, fetched as i64, data],
@@ -278,21 +330,22 @@ pub fn save_telemetry(c: &Connection, id: &str, fetched: u64, data: &str) {
 
 /// Stored rtk history rows (JSON) of the run a session file belongs to.
 pub fn rtk(c: &Connection, path: &Path) -> Option<String> {
-    c.query_row(
+    query_row(
+        c,
         "SELECT rows FROM rtk WHERE path=?1",
-        params![path.to_string_lossy()],
+        params![&*path.to_string_lossy()],
         |r| r.get(0),
     )
-    .optional()
     .ok()?
 }
 
 pub fn save_rtk(c: &Connection, path: &Path, rows: &str) {
     warn(
         "save rtk",
-        c.execute(
+        execute(
+            c,
             "INSERT INTO rtk (path, rows) VALUES (?1,?2) ON CONFLICT(path) DO UPDATE SET rows=excluded.rows WHERE rows != excluded.rows",
-            params![path.to_string_lossy(), rows],
+            params![&*path.to_string_lossy(), rows],
         ),
     );
 }
