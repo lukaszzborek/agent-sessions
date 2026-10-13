@@ -166,7 +166,15 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("telemetry: enabled");
     }
     let mut rows = db::load_all(&db.lock().unwrap_or_else(PoisonError::into_inner));
+    let t0 = Instant::now();
     let index = index::build(&roots, &db, &mut rows);
+    eprintln!(
+        "indexed {} sessions ({} files read, {} archived) in {:.1}s",
+        index.sessions.len(),
+        index::take_files_read().len(),
+        index.sessions.iter().filter(|s| s.archived).count(),
+        t0.elapsed().as_secs_f32()
+    );
     let titles = parsers::codex::load_titles(&roots.codex_homes());
     let (changed, _) = tokio::sync::broadcast::channel(16);
     let state = Arc::new(AppState {
@@ -285,9 +293,22 @@ fn summaries_json(idx: &Index) -> HashMap<String, String> {
 
 /// Poll session dirs; on any file change rebuild index and broadcast affected session keys.
 async fn watch_files(st: Arc<AppState>) {
+    const REPORT_EVERY: Duration = Duration::from_secs(5 * 60);
     let mut snap = index::snapshot(&st.roots);
+    let mut last_report = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        if last_report.elapsed() >= REPORT_EVERY {
+            last_report = Instant::now();
+            let reads = index::take_files_read();
+            if !reads.is_empty() {
+                let files = reads.iter().collect::<HashSet<_>>().len();
+                eprintln!(
+                    "read {files} changed session files ({} reads) in the last 5 min",
+                    reads.len()
+                );
+            }
+        }
         let cur = st.blocking(|st| index::snapshot(&st.roots)).await;
         let changed: HashSet<PathBuf> = cur
             .iter()

@@ -14,6 +14,14 @@ use walkdir::WalkDir;
 /// Bump when SessionSummary gains fields so stale DB rows get reparsed from stored raw.
 const VERSION: u32 = 12;
 
+// Summed across builds so the watcher's per-change rebuilds are reported periodically, not one line each.
+static FILES_READ: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Session files read from disk and parsed by `build` since the previous call, one entry per read.
+pub fn take_files_read() -> Vec<PathBuf> {
+    std::mem::take(&mut *FILES_READ.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
 // A poisoned lock only means another thread panicked mid-access; the data is still usable.
 fn lock(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(PoisonError::into_inner)
@@ -292,7 +300,6 @@ pub fn build(
 ) -> Index {
     // Price change must recompute stored costs, same as a parser change.
     let version = VERSION ^ crate::pricing::fingerprint();
-    let t0 = std::time::Instant::now();
     let prev = &*rows;
     let titles = parsers::codex::load_titles(&roots.codex_homes());
 
@@ -308,7 +315,6 @@ pub fn build(
         .into_iter()
         .map(|(p, agent)| (agent, p, true))
         .collect();
-    let on_disk = work.len();
     for (p, r) in prev {
         // A row whose path no longer matches any configured source (source removed/disabled,
         // glob changed) is dropped rather than surfaced as archived, matching the file-still-on-
@@ -392,7 +398,6 @@ pub fn build(
         })
         .collect();
 
-    let mut stored = 0;
     let mut sessions: Vec<SessionSummary> = Vec::with_capacity(results.len());
     // Meta tags are persisted in the summary so archived sessions keep them after the source dir is
     // cleaned. Read before taking the lock: it is file I/O.
@@ -447,7 +452,10 @@ pub fn build(
                     .unwrap_or_default();
                 row.summary.source = source.unwrap_or(USER_SOURCE).to_string();
                 let saved = db::upsert(tx, &path, &row, &blob);
-                stored += 1;
+                FILES_READ
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(path.clone());
                 sessions.push(row.summary.clone());
                 // Left out of the mirror on failure, so the next build parses and stores it again.
                 if saved {
@@ -550,15 +558,6 @@ pub fn build(
         .enumerate()
         .map(|(i, s)| ((s.agent, s.id.clone()), i))
         .collect();
-    let archived = sessions.iter().filter(|s| s.archived).count();
-    eprintln!(
-        "indexed {} sessions ({} files on disk, {} stored, {} archived) in {:.1}s",
-        sessions.len(),
-        on_disk,
-        stored,
-        archived,
-        t0.elapsed().as_secs_f32()
-    );
     Index { sessions, by_key }
 }
 
