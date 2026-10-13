@@ -252,7 +252,7 @@
   .legend i, .tip i, .dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
   .chart { position: relative; margin: 8px 0 0 52px; }
   .bars { display: flex; gap: 2px; height: 180px; border-bottom: 1px solid var(--line); position: relative; }
-  .col { flex: 1; min-width: 0; max-width: 40px; display: flex; flex-direction: column-reverse; gap: 1px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+  .col { flex: 1; min-width: 0;display: flex; flex-direction: column-reverse; gap: 1px; padding: 0; border: 0; background: transparent; cursor: pointer; }
   .col:hover, .col.sel { background: color-mix(in srgb, var(--fg) 7%, transparent); }
   .col.fade i { opacity: .35; }
   .col i { display: block; width: 100%; min-height: 1px; }
