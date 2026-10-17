@@ -25,6 +25,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
+// glibc keeps freed pages in per-thread arenas, so parallel index builds left RSS at ~700 MB.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, rust_embed::Embed)]
 #[folder = "../ui/dist/"]
 struct Assets;
