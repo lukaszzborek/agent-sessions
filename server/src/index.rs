@@ -5,9 +5,11 @@ use crate::parsers;
 use anyhow::Context;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 use turso::Connection;
 use walkdir::WalkDir;
 
@@ -292,12 +294,111 @@ struct Deduped {
 /// Per session path; only touched by `build`, which is serialized.
 static DEDUPED: Mutex<BTreeMap<PathBuf, Deduped>> = Mutex::new(BTreeMap::new());
 
+/// Seconds since its last write during which a Claude session file is live: parsed incrementally
+/// and kept in memory, not written to the db. A build that finds it idle stores it whole.
+const LIVE_FOR: u64 = 10 * 60;
+/// Bytes kept from before the parsed offset, to tell an appended file from a rewritten one.
+const TAIL: usize = 256;
+
+static LIVE: Mutex<BTreeMap<PathBuf, Arc<Mutex<Live>>>> = Mutex::new(BTreeMap::new());
+
+/// Live Claude session file, parsed up to `offset`.
+#[derive(Debug)]
+struct Live {
+    parser: parsers::claude::Claude,
+    offset: u64,
+    tail: Vec<u8>,
+    /// Unskipped summary, reused until more lines arrive.
+    summary: Option<SessionSummary>,
+}
+
+impl Live {
+    fn new(path: &Path) -> Self {
+        Live {
+            parser: parsers::claude::Claude::new(path),
+            offset: 0,
+            tail: Vec::new(),
+            summary: None,
+        }
+    }
+
+    /// Feeds the lines appended since the last call; starts over when the file was rewritten.
+    fn catch_up(&mut self, path: &Path) -> std::io::Result<()> {
+        let mut f = File::open(path)?;
+        let mut buf = Vec::new();
+        if f.metadata()?.len() >= self.offset {
+            f.seek(SeekFrom::Start(self.offset - self.tail.len() as u64))?;
+            f.read_to_end(&mut buf)?;
+        }
+        if !buf.starts_with(&self.tail) {
+            *self = Live::new(path);
+            f.seek(SeekFrom::Start(0))?;
+            buf.clear();
+            f.read_to_end(&mut buf)?;
+        }
+        let start = self.tail.len();
+        let used = self.parser.feed(&buf[start..]);
+        if used > 0 {
+            let end = start + used;
+            self.offset += used as u64;
+            self.tail = buf[end.saturating_sub(TAIL)..end].to_vec();
+            self.summary = None;
+            FILES_READ
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(path.to_path_buf());
+        }
+        Ok(())
+    }
+}
+
+fn is_live(mtime: u64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(mtime) < LIVE_FOR
+}
+
+/// Runs `f` on the live parse of a Claude session file, caught up with the file. None when the
+/// file is not live or cannot be read.
+fn with_live<T>(path: &Path, f: impl FnOnce(&mut Live) -> T) -> Option<T> {
+    if !is_live(stat(path).0) {
+        return None;
+    }
+    let entry = LIVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(Live::new(path))))
+        .clone();
+    let mut live = entry.lock().unwrap_or_else(PoisonError::into_inner);
+    live.catch_up(path).ok()?;
+    Some(f(&mut live))
+}
+
+fn live_summary(path: &Path) -> Option<SessionSummary> {
+    with_live(path, |l| {
+        l.summary
+            .get_or_insert_with(|| l.parser.finish(&HashSet::new()).summary)
+            .clone()
+    })
+}
+
+/// Parse of a Claude session file written to in the last few minutes, reading only what was
+/// appended since the previous call. None when the file is not live.
+pub fn parse_live(path: &Path, skip: &HashSet<String>) -> Option<Parsed> {
+    with_live(path, |l| l.parser.finish(skip))
+}
+
 #[derive(Debug)]
 enum Outcome {
     /// unchanged, reuse DB row
     Keep(SessionSummary),
     /// new/changed on disk: row + zstd blob of the raw file
     Store(db::Row, Vec<u8>),
+    /// live Claude file, parsed incrementally; its db row is left stale until it goes idle
+    Live(SessionSummary),
     /// on-disk file gone, stale version: reparsed from stored raw
     Resummarize(db::Row),
 }
@@ -315,6 +416,10 @@ pub fn build(
     let version = VERSION ^ crate::pricing::fingerprint();
     let prev = &*rows;
     let titles = parsers::codex::load_titles(&roots.codex_homes());
+    // Dropping an idle file from the live set makes this build read and store it whole.
+    LIVE.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|p, _| is_live(stat(p).0));
 
     // Patterns can match nested dirs and sources can overlap, so one file may be reached several
     // times; keyed by path so it is indexed once.
@@ -376,6 +481,11 @@ pub fn build(
                     // File is back on disk: a stored `archived=true` (e.g. mount came back) is stale.
                     s.archived = false;
                     return Some((path, Outcome::Keep(s)));
+                }
+            }
+            if agent == Agent::Claude {
+                if let Some(s) = live_summary(&path) {
+                    return Some((path, Outcome::Live(s)));
                 }
             }
             let data = match std::fs::read(&path) {
@@ -475,6 +585,13 @@ pub fn build(
                     rows.insert(path, row);
                 }
             }
+            Outcome::Live(mut s) => {
+                s.tags = auto
+                    .or_else(|| rows.get(&path).map(|r| r.summary.tags.clone()))
+                    .unwrap_or_default();
+                s.source = source.unwrap_or(USER_SOURCE).to_string();
+                sessions.push(s);
+            }
             Outcome::Resummarize(mut row) => {
                 if let Some(t) = auto {
                     row.summary.tags = t;
@@ -526,9 +643,17 @@ pub fn build(
                 Some(d) => d.clone(),
                 None => {
                     let skip: HashSet<String> = s.dup_request_ids.iter().cloned().collect();
-                    let p = read_source(&s.path, conn)
-                        .and_then(|data| parse_bytes(s.agent, &s.path, &data, &titles, &skip).ok())?
-                        .summary;
+                    let live = match s.agent {
+                        Agent::Claude => parse_live(&s.path, &skip),
+                        _ => None,
+                    };
+                    let p = match live {
+                        Some(p) => p,
+                        None => read_source(&s.path, conn).and_then(|data| {
+                            parse_bytes(s.agent, &s.path, &data, &titles, &skip).ok()
+                        })?,
+                    }
+                    .summary;
                     Deduped {
                         stat,
                         dup_request_ids: s.dup_request_ids.clone(),
@@ -620,6 +745,25 @@ mod tests {
         let skip: HashSet<String> = sessions[0].dup_request_ids.iter().cloned().collect();
         let deduped = parse("/p/b.jsonl", &fork_data, &skip);
         assert_eq!(deduped.usage.output, 5);
+    }
+
+    #[test]
+    fn live_file_is_read_incrementally_and_from_scratch_when_rewritten() {
+        let dir = std::env::temp_dir().join(format!("agent-sessions-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("S1.jsonl");
+        let lines = fixture("2026-09-01T10:00:00.000Z", &["r1", "r2"]);
+        let r1_end = lines.find('\n').unwrap() + 1;
+        // r2 is still being written.
+        std::fs::write(&path, &lines[..r1_end + 20]).unwrap();
+        assert_eq!(live_summary(&path).unwrap().usage.output, 5);
+        std::fs::write(&path, &lines).unwrap();
+        assert_eq!(live_summary(&path).unwrap().usage.output, 10);
+
+        std::fs::write(&path, fixture("2026-09-01T10:00:00.000Z", &["r3"])).unwrap();
+        let s = live_summary(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((s.usage.output, s.request_ids), (5, vec!["r3".to_string()]));
     }
 
     #[test]

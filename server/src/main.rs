@@ -397,6 +397,12 @@ async fn parse_session(
     let parsed = st
         .blocking(move |st| {
             let path = &summary.path;
+            let skip: HashSet<String> = summary.dup_request_ids.iter().cloned().collect();
+            if summary.agent == Agent::Claude {
+                if let Some(p) = index::parse_live(path, &skip) {
+                    return Ok(Arc::new(p));
+                }
+            }
             let stat = index::stat(path);
             let cached = st.parsed.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(c) = cached.as_ref().filter(|c| {
@@ -407,7 +413,6 @@ async fn parse_session(
             drop(cached);
             let data = index::read_source(path, &st.db)
                 .ok_or_else(|| anyhow::anyhow!("no source on disk or in db"))?;
-            let skip: HashSet<String> = summary.dup_request_ids.iter().cloned().collect();
             let parsed = Arc::new(index::parse_bytes(
                 summary.agent,
                 path,

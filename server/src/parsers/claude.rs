@@ -1,306 +1,164 @@
-use super::{read_jsonl, s, u};
+use super::{s, u};
 use crate::model::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `skip`: request ids whose usage another file counts (`SessionSummary::dup_request_ids`).
 pub fn parse(path: &Path, data: &[u8], skip: &HashSet<String>) -> anyhow::Result<Parsed> {
-    let lines = read_jsonl(data);
-    let file_id = path
-        .file_stem()
-        .and_then(|x| x.to_str())
-        .unwrap_or("")
-        .to_string();
-    let is_sub = file_id.starts_with("agent-");
-    // Path: <proj>/<sid>/subagents/agent-x.jsonl. Older versions wrote a flat
-    // <proj>/agent-x.jsonl whose parent cannot be told from the path; those keep the bare id.
-    let parent_id = path
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == "subagents"))
-        .and_then(|p| p.parent())
-        .and_then(|p| p.file_name())
-        .and_then(|x| x.to_str())
-        .filter(|_| is_sub)
-        .map(str::to_string);
-    // Claude Code writes the same `agent-<id>` file under every session that continues the parent,
-    // so the bare agent id is not unique; scoping it by the parent session is. No `/`, as ids go
-    // into URLs and `agent/id` tag keys.
-    let scope = parent_id.as_deref().unwrap_or(&file_id);
-    let children_scoped = parent_id.is_some() || path.with_extension("").join("subagents").is_dir();
-    let mut events: Vec<Event> = Vec::new();
-    // Streaming writes one line per content block under the same requestId; early lines carry
-    // partial output_tokens, so usage is settled per request and summed after the loop.
-    let mut req_usage: HashMap<String, (Usage, Option<f64>, Option<usize>)> = HashMap::new();
-    let mut usage = Usage::default();
-    let mut cost = 0.0f64;
-    let mut has_cost = false;
-    let mut title: Option<String> = None;
-    let mut summary_title: Option<String> = None;
-    let mut cwd = String::new();
-    let mut sid: Option<String> = None;
-    let mut git_branch = None;
-    let mut version = None;
-    let mut children: Vec<String> = Vec::new();
-    let mut hooks: BTreeMap<String, u32> = BTreeMap::new();
-    let mut skills: BTreeMap<String, u32> = BTreeMap::new();
-    let mut next_id = 0u32;
-    let mut id = || {
-        next_id += 1;
-        next_id
-    };
+    let mut c = Claude::new(path);
+    let used = c.feed(data);
+    // A last line without a newline is complete only at the end of a whole file.
+    c.line(&data[used..]);
+    Ok(c.finish(skip))
+}
 
-    for v in &lines {
-        let ty = s(v, "type").unwrap_or_default();
-        if cwd.is_empty() {
-            if let Some(c) = s(v, "cwd") {
-                cwd = c;
+/// A Claude session file parsed so far. Claude Code only appends to a session file, so a live
+/// session is fed just the bytes added since the last `feed` instead of being reparsed.
+#[derive(Debug, Clone)]
+pub struct Claude {
+    path: PathBuf,
+    file_id: String,
+    is_sub: bool,
+    parent_id: Option<String>,
+    events: Vec<Event>,
+    // Streaming writes one line per content block under the same requestId; early lines carry
+    // partial output_tokens, so usage is settled per request and summed in `finish`.
+    req_usage: HashMap<String, (Usage, Option<f64>, Option<usize>)>,
+    /// (event index, usage key) of events added only to carry a request's usage; `finish` drops
+    /// the ones whose request is skipped.
+    placeholders: Vec<(usize, String)>,
+    /// Models of all events so far.
+    models: HashSet<String>,
+    title: Option<String>,
+    summary_title: Option<String>,
+    cwd: String,
+    sid: Option<String>,
+    git_branch: Option<String>,
+    version: Option<String>,
+    /// Agent ids of spawned subagents, unscoped: whether they need scoping is known only once the
+    /// subagents dir exists.
+    children: Vec<String>,
+    hooks: BTreeMap<String, u32>,
+    skills: BTreeMap<String, u32>,
+    next_id: u32,
+}
+
+impl Claude {
+    pub fn new(path: &Path) -> Self {
+        let file_id = path
+            .file_stem()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_string();
+        let is_sub = file_id.starts_with("agent-");
+        // Path: <proj>/<sid>/subagents/agent-x.jsonl. Older versions wrote a flat
+        // <proj>/agent-x.jsonl whose parent cannot be told from the path; those keep the bare id.
+        let parent_id = path
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "subagents"))
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|x| x.to_str())
+            .filter(|_| is_sub)
+            .map(str::to_string);
+        Claude {
+            path: path.to_path_buf(),
+            file_id,
+            is_sub,
+            parent_id,
+            events: Vec::new(),
+            req_usage: HashMap::new(),
+            placeholders: Vec::new(),
+            models: HashSet::new(),
+            title: None,
+            summary_title: None,
+            cwd: String::new(),
+            sid: None,
+            git_branch: None,
+            version: None,
+            children: Vec::new(),
+            hooks: BTreeMap::new(),
+            skills: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+
+    fn id(&mut self) -> u32 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    /// Parses the complete lines of `data`; returns how many bytes they span. The rest is a line
+    /// still being written, to be fed again once it is complete.
+    pub fn feed(&mut self, data: &[u8]) -> usize {
+        let mut used = 0;
+        for line in data.split_inclusive(|b| *b == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            self.line(line);
+            used += line.len();
+        }
+        used
+    }
+
+    /// Parses one JSONL line; broken lines are skipped.
+    fn line(&mut self, line: &[u8]) {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        let ty = s(&v, "type").unwrap_or_default();
+        if self.cwd.is_empty() {
+            if let Some(c) = s(&v, "cwd") {
+                self.cwd = c;
             }
         }
-        if sid.is_none() {
-            sid = s(v, "sessionId");
+        if self.sid.is_none() {
+            self.sid = s(&v, "sessionId");
         }
-        if git_branch.is_none() {
-            git_branch = s(v, "gitBranch").filter(|x| !x.is_empty());
+        if self.git_branch.is_none() {
+            self.git_branch = s(&v, "gitBranch").filter(|x| !x.is_empty());
         }
-        if version.is_none() {
-            version = s(v, "version");
+        if self.version.is_none() {
+            self.version = s(&v, "version");
         }
-        let ts = s(v, "timestamp");
+        let ts = s(&v, "timestamp");
         match ty.as_str() {
             "summary" => {
-                summary_title = s(v, "summary");
+                self.summary_title = s(&v, "summary");
             }
-            "user" => {
-                let msg = &v["message"];
-                if let Some(c) = slash_command(&msg["content"]) {
-                    *skills.entry(c).or_default() += 1;
-                }
-                match &msg["content"] {
-                    Value::String(t) => {
-                        if !t.is_empty() {
-                            push_user(&mut events, id(), ts.clone(), t, &mut title);
-                        }
-                    }
-                    Value::Array(blocks) => {
-                        let mut texts = Vec::new();
-                        for b in blocks {
-                            match s(b, "type").as_deref() {
-                                Some("text") => {
-                                    if let Some(t) = s(b, "text") {
-                                        texts.push(t);
-                                    }
-                                }
-                                Some("image") => texts.push("[image]".into()),
-                                Some("tool_result") => {
-                                    let mut e = Event::new(id(), EventKind::ToolResult);
-                                    e.ts = ts.clone();
-                                    e.tool_call_id = s(b, "tool_use_id");
-                                    e.is_error = b["is_error"].as_bool().unwrap_or(false);
-                                    e.text = Some(tool_result_text(&b["content"]));
-                                    // Bash extras (stderr, interrupted, timeouts, background,
-                                    // sandbox).
-                                    let tr = &v["toolUseResult"];
-                                    if tr.get("stdout").is_some() {
-                                        let mut meta = serde_json::Map::new();
-                                        for k in [
-                                            "stderr",
-                                            "interrupted",
-                                            "timedOutAfterMs",
-                                            "backgroundTaskId",
-                                            "dangerouslyDisableSandbox",
-                                            "returnCodeInterpretation",
-                                        ] {
-                                            match tr.get(k) {
-                                                Some(Value::Bool(false))
-                                                | Some(Value::Null)
-                                                | None => {}
-                                                Some(Value::String(x)) if x.trim().is_empty() => {}
-                                                Some(x) => {
-                                                    meta.insert(k.into(), x.clone());
-                                                }
-                                            }
-                                        }
-                                        if !meta.is_empty() {
-                                            e.meta = Some(Value::Object(meta));
-                                        }
-                                    }
-                                    // Subagent link.
-                                    if let Some(aid) = v["toolUseResult"]["agentId"].as_str() {
-                                        let cid = if children_scoped {
-                                            format!("{scope}~{aid}")
-                                        } else {
-                                            aid.to_string()
-                                        };
-                                        if !children.contains(&cid) {
-                                            children.push(cid.clone());
-                                        }
-                                        e.child_session_id = Some(cid);
-                                        let mut meta = serde_json::Map::new();
-                                        for k in ["status", "resolvedModel", "description"] {
-                                            if let Some(x) = v["toolUseResult"].get(k) {
-                                                meta.insert(k.into(), x.clone());
-                                            }
-                                        }
-                                        e.meta = Some(Value::Object(meta));
-                                    }
-                                    events.push(e);
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !texts.is_empty() {
-                            let t = texts.join("\n");
-                            push_user(&mut events, id(), ts.clone(), &t, &mut title);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "assistant" => {
-                let msg = &v["message"];
-                let model = s(msg, "model").filter(|m| m != "<synthetic>");
-                let req = s(v, "requestId");
-                let mut usage_key = None;
-                if let Some(us) = msg.get("usage") {
-                    let uu = Usage {
-                        input: u(us, "input_tokens"),
-                        output: u(us, "output_tokens"),
-                        cache_read: u(us, "cache_read_input_tokens"),
-                        cache_write: u(us, "cache_creation_input_tokens"),
-                        cache_write_1h: u(&us["cache_creation"], "ephemeral_1h_input_tokens"),
-                        reasoning: u(&us["output_tokens_details"], "thinking_tokens"),
-                    };
-                    let key = req
-                        .clone()
-                        .unwrap_or_else(|| s(v, "uuid").unwrap_or_default());
-                    if !uu.is_zero() && !key.is_empty() && !skip.contains(&key) {
-                        let r = req_usage.entry(key.clone()).or_default();
-                        if uu.output >= r.0.output {
-                            r.1 = model.as_deref().and_then(|m| crate::pricing::cost(m, &uu));
-                            r.0 = uu;
-                        }
-                        usage_key = Some(key);
-                    }
-                }
-                let first_ev = events.len();
-                if let Some(blocks) = msg["content"].as_array() {
-                    for b in blocks {
-                        match s(b, "type").as_deref() {
-                            Some("text") => {
-                                let t = s(b, "text").unwrap_or_default();
-                                if t.trim().is_empty() {
-                                    continue;
-                                }
-                                let mut e = Event::new(id(), EventKind::Assistant);
-                                e.ts = ts.clone();
-                                e.model = model.clone();
-                                e.request_id = req.clone();
-                                e.text = Some(t);
-                                events.push(e);
-                            }
-                            Some("thinking") => {
-                                let mut e = Event::new(id(), EventKind::Thinking);
-                                e.ts = ts.clone();
-                                e.model = model.clone();
-                                e.request_id = req.clone();
-                                e.text = s(b, "thinking");
-                                events.push(e);
-                            }
-                            Some("tool_use") => {
-                                let name = s(b, "name").unwrap_or_default();
-                                if name == "Skill" {
-                                    if let Some(sk) = s(&b["input"], "skill") {
-                                        *skills.entry(sk).or_default() += 1;
-                                    }
-                                }
-                                let is_agent = name == "Agent" || name == "Task";
-                                let mut e = Event::new(
-                                    id(),
-                                    if is_agent {
-                                        EventKind::Subagent
-                                    } else {
-                                        EventKind::ToolCall
-                                    },
-                                );
-                                e.ts = ts.clone();
-                                e.model = model.clone();
-                                e.tool_call_id = s(b, "id");
-                                e.tool_name = Some(name);
-                                e.text = Some(json_text(&b["input"]));
-                                if is_agent {
-                                    let inp = &b["input"];
-                                    let mut meta = serde_json::Map::new();
-                                    for k in ["subagent_type", "description", "model"] {
-                                        if let Some(x) = inp.get(k) {
-                                            if !x.is_null() {
-                                                meta.insert(k.into(), x.clone());
-                                            }
-                                        }
-                                    }
-                                    e.meta = Some(Value::Object(meta));
-                                }
-                                events.push(e);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                if usage_key.is_some() && events.len() == first_ev {
-                    // Request produced no event (whitespace-only text, unknown block type): still
-                    // need a place to attach its usage/cost, so stats don't under-report it.
-                    let mut e = Event::new(id(), EventKind::Assistant);
-                    e.ts = ts.clone();
-                    e.model = model.clone();
-                    e.request_id = req.clone();
-                    e.text = Some(String::new());
-                    events.push(e);
-                }
-                if let Some(r) = usage_key.and_then(|k| req_usage.get_mut(&k)) {
-                    if r.2.is_none() && events.len() > first_ev {
-                        r.2 = Some(first_ev);
-                    }
-                }
-                // Model-only (empty content) message: still record model.
-                if let Some(m) = &model {
-                    if !events.iter().any(|e| e.model.as_deref() == Some(m)) {
-                        let mut e = Event::new(id(), EventKind::ModelChange);
-                        e.ts = ts.clone();
-                        e.model = Some(m.clone());
-                        e.text = Some(m.clone());
-                        events.push(e);
-                    }
-                }
-            }
+            "user" => self.user(&v, ts),
+            "assistant" => self.assistant(&v, ts),
             "attachment" => {
                 let a = &v["attachment"];
                 if s(a, "type").is_some_and(|t| t.starts_with("hook_")) {
                     if let Some(k) = s(a, "command").or_else(|| s(a, "hookName")) {
-                        *hooks.entry(k).or_default() += 1;
+                        *self.hooks.entry(k).or_default() += 1;
                     }
                 }
             }
             "system" => {
-                let sub = s(v, "subtype").unwrap_or_default();
+                let sub = s(&v, "subtype").unwrap_or_default();
                 if sub == "stop_hook_summary" {
                     for h in v["hookInfos"].as_array().into_iter().flatten() {
                         if let Some(c) = s(h, "command") {
-                            *hooks.entry(c).or_default() += 1;
+                            *self.hooks.entry(c).or_default() += 1;
                         }
                     }
                 } else if sub == "compact_boundary" {
-                    let mut e = Event::new(id(), EventKind::Compaction);
-                    e.ts = ts.clone();
+                    let mut e = Event::new(self.id(), EventKind::Compaction);
+                    e.ts = ts;
                     e.text = Some("context compacted".into());
-                    events.push(e);
-                } else if let Some(c) = s(v, "content") {
+                    self.events.push(e);
+                } else if let Some(c) = s(&v, "content") {
                     let c = strip_tags(&c);
                     if !c.trim().is_empty() && !c.contains("<local-command") {
-                        let mut e = Event::new(id(), EventKind::System);
-                        e.ts = ts.clone();
+                        let mut e = Event::new(self.id(), EventKind::System);
+                        e.ts = ts;
                         e.text = Some(c);
                         e.meta = Some(serde_json::json!({ "subtype": sub }));
-                        events.push(e);
+                        self.events.push(e);
                     }
                 }
             }
@@ -308,130 +166,381 @@ pub fn parse(path: &Path, data: &[u8], skip: &HashSet<String>) -> anyhow::Result
         }
     }
 
-    let mut request_ids: Vec<String> = req_usage.keys().cloned().collect();
-    request_ids.sort_unstable();
-    for (u, c, idx) in req_usage.into_values() {
-        usage.add(&u);
-        if let Some(c) = c {
-            cost += c;
-            has_cost = true;
+    fn user(&mut self, v: &Value, ts: Option<String>) {
+        let msg = &v["message"];
+        if let Some(c) = slash_command(&msg["content"]) {
+            *self.skills.entry(c).or_default() += 1;
         }
-        if let Some(e) = idx.and_then(|i| events.get_mut(i)) {
-            e.usage = Some(u);
-            e.cost = c;
-        }
-    }
-
-    // Link Subagent tool_use events to child ids via their tool_result.
-    let pairs: Vec<(String, String, Option<Value>)> = events
-        .iter()
-        .filter(|e| e.kind == EventKind::ToolResult)
-        .filter_map(|e| {
-            let rm = e
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("resolvedModel"))
-                .cloned();
-            Some((
-                e.tool_call_id.clone().unwrap_or_default(),
-                e.child_session_id.clone()?,
-                rm,
-            ))
-        })
-        .collect();
-    for e in events.iter_mut().filter(|e| e.kind == EventKind::Subagent) {
-        if let Some((_, cid, rm)) = pairs
-            .iter()
-            .find(|(tid, _, _)| Some(tid) == e.tool_call_id.as_ref())
-        {
-            e.child_session_id = Some(cid.clone());
-            if let (Some(rm), Some(Value::Object(m))) = (rm, e.meta.as_mut()) {
-                m.insert("resolvedModel".into(), rm.clone());
-            }
-        }
-    }
-
-    // Insert model change markers where model switches between assistant events.
-    let mut last_model: Option<String> = None;
-    let mut i = 0;
-    while i < events.len() {
-        if let Some(m) = events[i].model.clone() {
-            if last_model.as_ref() != Some(&m)
-                && last_model.is_some()
-                && events[i].kind != EventKind::ModelChange
-            {
-                let mut e = Event::new(id(), EventKind::ModelChange);
-                e.ts = events[i].ts.clone();
-                e.model = Some(m.clone());
-                e.text = Some(format!("switched to {}", m));
-                events.insert(i, e);
-                i += 1;
-            }
-            last_model = Some(m);
-        }
-        i += 1;
-    }
-
-    let id_final = match file_id.strip_prefix("agent-") {
-        Some(aid) => match &parent_id {
-            Some(p) => format!("{p}~{aid}"),
-            None => aid.to_string(),
-        },
-        None => sid.unwrap_or(file_id),
-    };
-    let mut summary = SessionSummary {
-        agent: Agent::Claude,
-        id: id_final,
-        path: path.to_path_buf(),
-        cwd,
-        title: summary_title
-            .or(title)
-            .unwrap_or_else(|| "(untitled)".into()),
-        started: None,
-        ended: None,
-        models: vec![],
-        user_msgs: 0,
-        assistant_msgs: 0,
-        tool_calls: 0,
-        tools: vec![],
-        usage,
-        cost: if has_cost { Some(cost) } else { None },
-        parent_id,
-        children,
-        git_branch,
-        version,
-        spawn_tool_call_id: None,
-        archived: false,
-        hooks: sorted_counts(hooks),
-        skills: sorted_counts(skills),
-        cmds: vec![],
-        subagents: vec![],
-        agent_type: None,
-        tags: vec![],
-        source: String::new(),
-        max_context: 0,
-        buckets: vec![],
-        request_ids,
-        dup_request_ids: vec![],
-        context_window: None,
-    };
-    if is_sub {
-        // Subagent meta file.
-        let meta_path = path.with_extension("meta.json");
-        if let Ok(m) = std::fs::read(&meta_path) {
-            if let Ok(m) = serde_json::from_slice::<Value>(&m) {
-                let t = s(&m, "agentType").unwrap_or_default();
-                let d = s(&m, "description").unwrap_or_default();
-                summary.title = format!("[{}] {}", t, d);
+        match &msg["content"] {
+            Value::String(t) => {
                 if !t.is_empty() {
-                    summary.agent_type = Some(t);
+                    let id = self.id();
+                    push_user(&mut self.events, id, ts, t, &mut self.title);
                 }
-                summary.spawn_tool_call_id = s(&m, "toolUseId");
             }
+            Value::Array(blocks) => {
+                let mut texts = Vec::new();
+                for b in blocks {
+                    match s(b, "type").as_deref() {
+                        Some("text") => {
+                            if let Some(t) = s(b, "text") {
+                                texts.push(t);
+                            }
+                        }
+                        Some("image") => texts.push("[image]".into()),
+                        Some("tool_result") => {
+                            let mut e = Event::new(self.id(), EventKind::ToolResult);
+                            e.ts = ts.clone();
+                            e.tool_call_id = s(b, "tool_use_id");
+                            e.is_error = b["is_error"].as_bool().unwrap_or(false);
+                            e.text = Some(tool_result_text(&b["content"]));
+                            // Bash extras (stderr, interrupted, timeouts, background, sandbox).
+                            let tr = &v["toolUseResult"];
+                            if tr.get("stdout").is_some() {
+                                let mut meta = serde_json::Map::new();
+                                for k in [
+                                    "stderr",
+                                    "interrupted",
+                                    "timedOutAfterMs",
+                                    "backgroundTaskId",
+                                    "dangerouslyDisableSandbox",
+                                    "returnCodeInterpretation",
+                                ] {
+                                    match tr.get(k) {
+                                        Some(Value::Bool(false)) | Some(Value::Null) | None => {}
+                                        Some(Value::String(x)) if x.trim().is_empty() => {}
+                                        Some(x) => {
+                                            meta.insert(k.into(), x.clone());
+                                        }
+                                    }
+                                }
+                                if !meta.is_empty() {
+                                    e.meta = Some(Value::Object(meta));
+                                }
+                            }
+                            // Subagent link; scoped to a child id in `finish`.
+                            if let Some(aid) = tr["agentId"].as_str() {
+                                if !self.children.iter().any(|c| c == aid) {
+                                    self.children.push(aid.to_string());
+                                }
+                                e.child_session_id = Some(aid.to_string());
+                                let mut meta = serde_json::Map::new();
+                                for k in ["status", "resolvedModel", "description"] {
+                                    if let Some(x) = tr.get(k) {
+                                        meta.insert(k.into(), x.clone());
+                                    }
+                                }
+                                e.meta = Some(Value::Object(meta));
+                            }
+                            self.events.push(e);
+                        }
+                        _ => {}
+                    }
+                }
+                if !texts.is_empty() {
+                    let t = texts.join("\n");
+                    let id = self.id();
+                    push_user(&mut self.events, id, ts, &t, &mut self.title);
+                }
+            }
+            _ => {}
         }
     }
-    summarize_from_events(&mut summary, &mut events);
-    Ok(Parsed { summary, events })
+
+    fn assistant(&mut self, v: &Value, ts: Option<String>) {
+        let msg = &v["message"];
+        let model = s(msg, "model").filter(|m| m != "<synthetic>");
+        let req = s(v, "requestId");
+        let mut usage_key = None;
+        if let Some(us) = msg.get("usage") {
+            let uu = Usage {
+                input: u(us, "input_tokens"),
+                output: u(us, "output_tokens"),
+                cache_read: u(us, "cache_read_input_tokens"),
+                cache_write: u(us, "cache_creation_input_tokens"),
+                cache_write_1h: u(&us["cache_creation"], "ephemeral_1h_input_tokens"),
+                reasoning: u(&us["output_tokens_details"], "thinking_tokens"),
+            };
+            let key = req
+                .clone()
+                .unwrap_or_else(|| s(v, "uuid").unwrap_or_default());
+            if !uu.is_zero() && !key.is_empty() {
+                let r = self.req_usage.entry(key.clone()).or_default();
+                if uu.output >= r.0.output {
+                    r.1 = model.as_deref().and_then(|m| crate::pricing::cost(m, &uu));
+                    r.0 = uu;
+                }
+                usage_key = Some(key);
+            }
+        }
+        let first_ev = self.events.len();
+        if let Some(blocks) = msg["content"].as_array() {
+            for b in blocks {
+                match s(b, "type").as_deref() {
+                    Some("text") => {
+                        let t = s(b, "text").unwrap_or_default();
+                        if t.trim().is_empty() {
+                            continue;
+                        }
+                        let mut e = Event::new(self.id(), EventKind::Assistant);
+                        e.ts = ts.clone();
+                        e.model = model.clone();
+                        e.request_id = req.clone();
+                        e.text = Some(t);
+                        self.events.push(e);
+                    }
+                    Some("thinking") => {
+                        let mut e = Event::new(self.id(), EventKind::Thinking);
+                        e.ts = ts.clone();
+                        e.model = model.clone();
+                        e.request_id = req.clone();
+                        e.text = s(b, "thinking");
+                        self.events.push(e);
+                    }
+                    Some("tool_use") => {
+                        let name = s(b, "name").unwrap_or_default();
+                        if name == "Skill" {
+                            if let Some(sk) = s(&b["input"], "skill") {
+                                *self.skills.entry(sk).or_default() += 1;
+                            }
+                        }
+                        let is_agent = name == "Agent" || name == "Task";
+                        let kind = if is_agent {
+                            EventKind::Subagent
+                        } else {
+                            EventKind::ToolCall
+                        };
+                        let mut e = Event::new(self.id(), kind);
+                        e.ts = ts.clone();
+                        e.model = model.clone();
+                        e.tool_call_id = s(b, "id");
+                        e.tool_name = Some(name);
+                        e.text = Some(json_text(&b["input"]));
+                        if is_agent {
+                            let inp = &b["input"];
+                            let mut meta = serde_json::Map::new();
+                            for k in ["subagent_type", "description", "model"] {
+                                if let Some(x) = inp.get(k) {
+                                    if !x.is_null() {
+                                        meta.insert(k.into(), x.clone());
+                                    }
+                                }
+                            }
+                            e.meta = Some(Value::Object(meta));
+                        }
+                        self.events.push(e);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(key) = &usage_key {
+            if self.events.len() == first_ev {
+                // Request produced no event (whitespace-only text, unknown block type): still
+                // need a place to attach its usage/cost, so stats don't under-report it.
+                let mut e = Event::new(self.id(), EventKind::Assistant);
+                e.ts = ts.clone();
+                e.model = model.clone();
+                e.request_id = req.clone();
+                e.text = Some(String::new());
+                self.placeholders.push((self.events.len(), key.clone()));
+                self.events.push(e);
+            }
+        }
+        if let Some(r) = usage_key.and_then(|k| self.req_usage.get_mut(&k)) {
+            if r.2.is_none() && self.events.len() > first_ev {
+                r.2 = Some(first_ev);
+            }
+        }
+        // Model-only (empty content) message: still record model. Every event this line added
+        // carries `model`, so it is known when there are any.
+        if let Some(m) = model {
+            if self.events.len() == first_ev && !self.models.contains(&m) {
+                let mut e = Event::new(self.id(), EventKind::ModelChange);
+                e.ts = ts;
+                e.model = Some(m.clone());
+                e.text = Some(m.clone());
+                self.events.push(e);
+            }
+            self.models.insert(m);
+        }
+    }
+
+    /// Summary and events of everything fed so far. `skip`: request ids whose usage another file
+    /// counts (`SessionSummary::dup_request_ids`).
+    pub fn finish(&self, skip: &HashSet<String>) -> Parsed {
+        let mut events = self.events.clone();
+        let mut usage = Usage::default();
+        let mut cost = 0.0f64;
+        let mut has_cost = false;
+        let mut request_ids: Vec<String> = Vec::new();
+        for (key, (u, c, idx)) in &self.req_usage {
+            if skip.contains(key) {
+                continue;
+            }
+            request_ids.push(key.clone());
+            usage.add(u);
+            if let Some(c) = c {
+                cost += c;
+                has_cost = true;
+            }
+            if let Some(e) = idx.and_then(|i| events.get_mut(i)) {
+                e.usage = Some(u.clone());
+                e.cost = *c;
+            }
+        }
+        request_ids.sort_unstable();
+        let dropped: HashSet<usize> = self
+            .placeholders
+            .iter()
+            .filter(|(_, k)| skip.contains(k))
+            .map(|(i, _)| *i)
+            .collect();
+        if !dropped.is_empty() {
+            let mut i = 0;
+            events.retain(|_| {
+                i += 1;
+                !dropped.contains(&(i - 1))
+            });
+        }
+
+        // Claude Code writes the same `agent-<id>` file under every session that continues the
+        // parent, so the bare agent id is not unique; scoping it by the parent session is. No `/`,
+        // as ids go into URLs and `agent/id` tag keys.
+        let scope = self.parent_id.as_deref().unwrap_or(&self.file_id);
+        let scoped =
+            self.parent_id.is_some() || self.path.with_extension("").join("subagents").is_dir();
+        let child_id = |aid: &str| {
+            if scoped {
+                format!("{scope}~{aid}")
+            } else {
+                aid.to_string()
+            }
+        };
+        for e in events
+            .iter_mut()
+            .filter(|e| e.kind == EventKind::ToolResult)
+        {
+            if let Some(aid) = &e.child_session_id {
+                e.child_session_id = Some(child_id(aid));
+            }
+        }
+
+        // Link Subagent tool_use events to child ids via their tool_result.
+        let pairs: Vec<(String, String, Option<Value>)> = events
+            .iter()
+            .filter(|e| e.kind == EventKind::ToolResult)
+            .filter_map(|e| {
+                let rm = e
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("resolvedModel"))
+                    .cloned();
+                Some((
+                    e.tool_call_id.clone().unwrap_or_default(),
+                    e.child_session_id.clone()?,
+                    rm,
+                ))
+            })
+            .collect();
+        for e in events.iter_mut().filter(|e| e.kind == EventKind::Subagent) {
+            if let Some((_, cid, rm)) = pairs
+                .iter()
+                .find(|(tid, _, _)| Some(tid) == e.tool_call_id.as_ref())
+            {
+                e.child_session_id = Some(cid.clone());
+                if let (Some(rm), Some(Value::Object(m))) = (rm, e.meta.as_mut()) {
+                    m.insert("resolvedModel".into(), rm.clone());
+                }
+            }
+        }
+
+        // Insert model change markers where model switches between assistant events.
+        let mut next_id = self.next_id;
+        let mut last_model: Option<String> = None;
+        let mut i = 0;
+        while i < events.len() {
+            if let Some(m) = events[i].model.clone() {
+                if last_model.as_ref() != Some(&m)
+                    && last_model.is_some()
+                    && events[i].kind != EventKind::ModelChange
+                {
+                    next_id += 1;
+                    let mut e = Event::new(next_id, EventKind::ModelChange);
+                    e.ts = events[i].ts.clone();
+                    e.model = Some(m.clone());
+                    e.text = Some(format!("switched to {}", m));
+                    events.insert(i, e);
+                    i += 1;
+                }
+                last_model = Some(m);
+            }
+            i += 1;
+        }
+
+        let id = match self.file_id.strip_prefix("agent-") {
+            Some(aid) => match &self.parent_id {
+                Some(p) => format!("{p}~{aid}"),
+                None => aid.to_string(),
+            },
+            None => self.sid.clone().unwrap_or_else(|| self.file_id.clone()),
+        };
+        let mut summary = SessionSummary {
+            agent: Agent::Claude,
+            id,
+            path: self.path.clone(),
+            cwd: self.cwd.clone(),
+            title: self
+                .summary_title
+                .clone()
+                .or_else(|| self.title.clone())
+                .unwrap_or_else(|| "(untitled)".into()),
+            started: None,
+            ended: None,
+            models: vec![],
+            user_msgs: 0,
+            assistant_msgs: 0,
+            tool_calls: 0,
+            tools: vec![],
+            usage,
+            cost: if has_cost { Some(cost) } else { None },
+            parent_id: self.parent_id.clone(),
+            children: self.children.iter().map(|a| child_id(a)).collect(),
+            git_branch: self.git_branch.clone(),
+            version: self.version.clone(),
+            spawn_tool_call_id: None,
+            archived: false,
+            hooks: sorted_counts(self.hooks.clone()),
+            skills: sorted_counts(self.skills.clone()),
+            cmds: vec![],
+            subagents: vec![],
+            agent_type: None,
+            tags: vec![],
+            source: String::new(),
+            max_context: 0,
+            buckets: vec![],
+            request_ids,
+            dup_request_ids: vec![],
+            context_window: None,
+        };
+        if self.is_sub {
+            // Subagent meta file.
+            let meta_path = self.path.with_extension("meta.json");
+            if let Ok(m) = std::fs::read(&meta_path) {
+                if let Ok(m) = serde_json::from_slice::<Value>(&m) {
+                    let t = s(&m, "agentType").unwrap_or_default();
+                    let d = s(&m, "description").unwrap_or_default();
+                    summary.title = format!("[{}] {}", t, d);
+                    if !t.is_empty() {
+                        summary.agent_type = Some(t);
+                    }
+                    summary.spawn_tool_call_id = s(&m, "toolUseId");
+                }
+            }
+        }
+        summarize_from_events(&mut summary, &mut events);
+        Parsed { summary, events }
+    }
 }
 
 fn push_user(
@@ -607,5 +716,30 @@ mod tests {
         let deduped = parse(path, data.as_bytes(), &skip).unwrap();
         assert!(deduped.summary.usage.is_zero() && deduped.summary.cost.is_none());
         assert!(deduped.summary.buckets.is_empty());
+    }
+
+    #[test]
+    fn feeding_in_chunks_matches_one_parse() {
+        let user = r#"{"type":"user","timestamp":"2026-09-01T09:59:00.000Z","sessionId":"S1","cwd":"/w","message":{"content":"fix the bug"}}"#;
+        let blank = r#"{"type":"assistant","timestamp":"2026-09-01T10:01:00.000Z","requestId":"r3","message":{"model":"claude-sonnet-5","content":[{"type":"text","text":" "}],"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        let data = [user, &assistant("r1"), &assistant("r2"), blank].join("\n") + "\n";
+        let path = Path::new("/p/S1.jsonl");
+        let skip = HashSet::from(["r2".to_string(), "r3".to_string()]);
+        let whole = parse(path, data.as_bytes(), &skip).unwrap();
+        // Every cut point, including ones inside a line still being written.
+        for cut in 0..data.len() {
+            let mut c = Claude::new(path);
+            let used = c.feed(&data.as_bytes()[..cut]);
+            assert_eq!(c.feed(&data.as_bytes()[used..]), data.len() - used);
+            let chunked = c.finish(&skip);
+            assert_eq!(
+                serde_json::to_string(&chunked.summary).unwrap(),
+                serde_json::to_string(&whole.summary).unwrap()
+            );
+            assert_eq!(chunked.events.len(), whole.events.len());
+        }
+        // The skipped request without content leaves no empty event behind.
+        assert_eq!(whole.summary.assistant_msgs, 2);
+        assert_eq!(whole.summary.usage.output, 5);
     }
 }
