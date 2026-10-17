@@ -11,6 +11,8 @@ pub const USER_SOURCE: &str = "user";
 #[derive(Debug, Clone, Deserialize)]
 pub struct Source {
     pub name: String,
+    /// With `ssh` set, a path on that host; empty means the remote home.
+    #[serde(default)]
     pub path: PathBuf,
     /// Glob patterns relative to `path`, matching dirs that hold that agent's `*.jsonl` logs
     /// (searched recursively).
@@ -24,6 +26,11 @@ pub struct Source {
     pub meta: Option<String>,
     #[serde(default = "enabled")]
     pub enabled: bool,
+    /// `user@host` or a `~/.ssh/config` alias: the source is mirrored from that host with rsync.
+    pub ssh: Option<String>,
+    /// Seconds between rsync runs of an `ssh` source.
+    #[serde(default = "interval")]
+    pub interval: u64,
 }
 
 impl Source {
@@ -36,12 +43,18 @@ impl Source {
             pi: Some(".pi/agent/sessions".into()),
             meta: None,
             enabled: true,
+            ssh: None,
+            interval: interval(),
         }
     }
 }
 
 fn enabled() -> bool {
     true
+}
+
+fn interval() -> u64 {
+    300
 }
 
 /// `[telemetry]`: Claude Code OTel enrichment.
@@ -144,10 +157,22 @@ pub fn get() -> &'static Config {
             if !s.enabled {
                 return false;
             }
-            let ok = !s.name.trim().is_empty() && names.insert(s.name.clone());
+            // An ssh source's name becomes its mirror dir, which rsync --delete prunes, so it
+            // must not be able to point elsewhere.
+            let shape_ok = match s.ssh {
+                Some(_) => {
+                    !s.name.starts_with('.')
+                        && s.name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                }
+                None => !s.path.as_os_str().is_empty(),
+            };
+            let ok = shape_ok && !s.name.trim().is_empty() && names.insert(s.name.clone());
             if !ok {
                 eprintln!(
-                    "config: source {:?} skipped (name empty, duplicate or reserved)",
+                    "config: source {:?} skipped (name empty, duplicate or reserved; no path; \
+                     or with ssh, name not made of letters, digits, '-', '_', '.')",
                     s.name
                 );
             }
@@ -158,10 +183,8 @@ pub fn get() -> &'static Config {
             .iter_mut()
             .filter(|s| s.claude.is_none() && s.codex.is_none() && s.pi.is_none())
         {
-            *s = Source {
-                meta: s.meta.take(),
-                ..Source::home(&s.name, s.path.clone())
-            };
+            let home = Source::home(&s.name, s.path.clone());
+            (s.claude, s.codex, s.pi) = (home.claude, home.codex, home.pi);
         }
         c
     })

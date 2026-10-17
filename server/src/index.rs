@@ -53,6 +53,9 @@ fn migrate_data_dir(data_root: &Path, new_dir: &Path) {
 pub struct Roots {
     /// Built-in `user` source (own home) followed by the enabled `sources` from config.
     pub sources: Vec<Source>,
+    /// `ssh` sources as configured (remote `path`) with their local mirror dir, which is their
+    /// `path` in `sources`.
+    pub remotes: Vec<(Source, PathBuf)>,
     pub db_file: PathBuf,
 }
 
@@ -65,9 +68,19 @@ impl Roots {
         let data = data_root.join("agent-sessions");
         migrate_data_dir(&data_root, &data);
         let mut sources = vec![Source::home(USER_SOURCE, home)];
-        sources.extend(crate::config::get().sources.iter().cloned());
+        let mut remotes = Vec::new();
+        for s in &crate::config::get().sources {
+            let mut s = s.clone();
+            if s.ssh.is_some() {
+                let mirror = data.join("remote").join(&s.name);
+                remotes.push((s.clone(), mirror.clone()));
+                s.path = mirror;
+            }
+            sources.push(s);
+        }
         Ok(Roots {
             sources,
+            remotes,
             db_file: data.join("sessions.db"),
         })
     }
@@ -143,7 +156,7 @@ impl Roots {
 }
 
 /// Leading components of a glob pattern that contain no glob syntax.
-fn literal_prefix(pat: &str) -> PathBuf {
+pub fn literal_prefix(pat: &str) -> PathBuf {
     Path::new(pat)
         .components()
         .take_while(|c| !c.as_os_str().to_string_lossy().contains(['*', '?', '[']))

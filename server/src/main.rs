@@ -5,6 +5,7 @@ mod index;
 mod model;
 mod parsers;
 mod pricing;
+mod remote;
 
 use anyhow::Context;
 use axum::{
@@ -193,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
     });
     tokio::spawn(watch_files(state.clone()));
     tokio::spawn(sync_external(state.clone()));
+    for (src, mirror) in &state.roots.remotes {
+        tokio::spawn(remote::sync(src.clone(), mirror.clone()));
+    }
 
     let app = Router::new()
         .route("/api/sessions", get(list_sessions))

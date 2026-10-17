@@ -110,6 +110,10 @@ codex = "**/codex-sessions"
 meta = "meta.json"
 
 [[sources]]
+name = "devbox"
+ssh = "me@devbox"                        # or a ~/.ssh/config alias; path defaults to the remote home
+
+[[sources]]
 name = "ci"
 path = "/srv/ci"
 claude = "logs"
@@ -124,12 +128,25 @@ The list has one toggle per source (only `user` on by default, remembered per br
 | key | |
 |---|---|
 | `name` | required, unique, `user` is reserved; invalid entries are logged and skipped |
-| `path` | required, base dir |
+| `path` | required, base dir; with `ssh` a dir on that host, default the remote home |
 | `claude` / `codex` / `pi` | glob relative to `path` matching dirs that hold that agent's `*.jsonl` logs (each walked recursively; `"."` = `path` itself). None of the three set = `path` is a home dir: `.claude/projects`, `.codex/sessions`, `.pi/agent/sessions` |
 | `meta` | name of a JSON file carrying `tags` for the sessions below it, see [tags](#tags) |
 | `enabled` | default `true`; `false` keeps the entry but skips indexing |
+| `ssh` | `user@host` or `~/.ssh/config` alias: sessions come from another machine, see [remote sources](#remote-sources) |
+| `interval` | with `ssh`, seconds between syncs, default `300` |
 
 Nothing is auto-detected: on WSL the Windows-side CLIs' logs need an entry like `windows` above.
+
+#### Remote sources
+
+A source with `ssh` reads another machine (VM, server) without running anything there but sshd and `rsync`.
+Every `interval` seconds the server runs `rsync` over `ssh` and mirrors the agent dirs of that host into `remote/<name>/` in the data dir;
+the mirror is then indexed like a local source. Only `*.jsonl` files and the `meta` file are copied
+(rtk history is not). Session files deleted on the host are deleted from the mirror and show as archived, like local ones.
+When the host is unreachable the mirror stays as it was, and one error line is logged until a sync succeeds again.
+
+Needs `rsync` on both machines and key-based ssh that works without a prompt (`BatchMode`): run `ssh me@devbox` once by hand
+to accept the host key. The `name` of an `ssh` source is used as a dir name, so only letters, digits, `-`, `_` and `.` are allowed.
 
 ### Tags
 
@@ -205,6 +222,7 @@ just dev-ui              # vite dev server, proxies /api to :7777
 | `server/src/model.rs` | `SessionSummary`, `Event`, `Usage` |
 | `server/src/db.rs` | Turso (SQLite-format) store (raw blob + summary per file, tags, telemetry, rtk) |
 | `server/src/config.rs` | config file + `Source` definition |
+| `server/src/remote.rs` | rsync mirror of `ssh` sources |
 | `server/src/pricing.rs` | price table + `prices.toml` |
 | `server/src/extensions/{telemetry,rtk}.rs` | optional per-session enrichment |
 | `ui/src/App.svelte` | hash routing: session / `#/stats` / `#/compare` |
