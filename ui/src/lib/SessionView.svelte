@@ -3,7 +3,7 @@
   import { fmtDate, fmtDur, fmtNum, fmtCost, fmtMs, fmtSecs, project, totalTokens } from './fmt'
   import EventCard from './EventCard.svelte'
   import Flow from './Flow.svelte'
-  import Stats from './Stats.svelte'
+  import SessionStats from './SessionStats.svelte'
   import { live } from './live.svelte'
   import { tick, untrack } from 'svelte'
 
@@ -151,6 +151,7 @@
     walk(s)
     return out
   })
+  const subCost = $derived(scope.slice(1).reduce((a, x) => a + (x.cost ?? 0), 0))
 </script>
 
 {#if error}
@@ -181,6 +182,7 @@
       <span class="muted">Σ {fmtNum(totalTokens(s.usage))}</span>
       {#if s.max_context}<span title="peak context: prompt tokens of the largest single API call{s.context_window ? ` (window ${fmtNum(s.context_window)})` : ''}">ctx {fmtNum(s.max_context)}{#if s.context_window} / {fmtNum(s.context_window)} ({Math.round((100 * s.max_context) / s.context_window)}%){/if}</span>{/if}
       {#if s.cost != null}<span class="muted" title="API list price equivalent (subscription plans bill differently)">{fmtCost(s.cost)}</span>{/if}
+      {#if subCost}<span class="muted" title="this session + its subagents">Σ {fmtCost((s.cost ?? 0) + subCost)} with subagents</span>{/if}
       {#if rtk}<span title="rtk history: rewritten shell calls / all shell calls · tokens rtk claims it filtered out of {fmtNum(rtk.input)} raw">rtk {rtk.hit}/{rtk.calls} calls · {fmtNum(-rtk.saved)} tok</span>{/if}
     </div>
     <div class="row tags">
@@ -233,7 +235,7 @@
     </div>
   </div>
   {#if mode === 'stats'}
-    <Stats sessions={scope} scoped />
+    <SessionStats sessions={scope} />
   {:else if mode === 'flow'}
     <Flow {detail} {byKey} />
   {:else}

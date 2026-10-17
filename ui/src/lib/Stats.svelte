@@ -1,16 +1,16 @@
 <script lang="ts">
   import type { Session } from './types'
-  import { fmtNum, fmtCost, project, shortHook } from './fmt'
+  import { fmtNum, fmtCost, project } from './fmt'
   import { range } from './range.svelte'
   import RangePicker from './RangePicker.svelte'
+  import ModelMatrix from './ModelMatrix.svelte'
+  import UsageLists from './UsageLists.svelte'
+  import { type Metric, METRICS, PALETTE, OTHER, valOf, modelColor } from './metric'
 
-  // scoped: single session (+ its subagents) - no date range
-  let { sessions, scoped = false }: { sessions: Session[]; scoped?: boolean } = $props()
+  let { sessions }: { sessions: Session[] } = $props()
 
   type Dim = 'model' | 'agent' | 'subagent' | 'project'
   const DIMS: Dim[] = ['model', 'agent', 'subagent', 'project']
-  type Metric = 'cost' | 'out' | 'tokens' | 'tools'
-  const METRICS: [Metric, string][] = [['cost', 'cost'], ['out', 'out tok'], ['tokens', 'total tok'], ['tools', 'tool calls']]
 
   let dim = $state<Dim>('model')
   let metric = $state<Metric>('cost')
@@ -32,7 +32,7 @@
     const out: Row[] = []
     for (const s of sessions) for (const b of s.buckets ?? []) {
       const day = localDay(b.hour)
-      if (!scoped && ((range.from && day < range.from) || (range.to && day > range.to))) continue
+      if ((range.from && day < range.from) || (range.to && day > range.to)) continue
       out.push({ day, s, model: b.model, tools: b.tool_calls, input: b.usage.input, cache: b.usage.cache_read + b.usage.cache_write, output: b.usage.output, cost: b.cost })
     }
     return out
@@ -43,12 +43,6 @@
     agent: (r) => r.s.agent,
     subagent: (r) => r.s.agent_type ?? (r.s.parent_id ? '?' : '(main)'),
     project: (r) => project(r.s.cwd),
-  }
-  const valOf: Record<Metric, (r: { tools: number; input: number; cache: number; output: number; cost: number }) => number> = {
-    cost: (r) => r.cost,
-    out: (r) => r.output,
-    tokens: (r) => r.input + r.cache + r.output,
-    tools: (r) => r.tools,
   }
   const fmtVal = (v: number) => (metric === 'cost' ? fmtCost(v) : fmtNum(Math.round(v)))
 
@@ -66,11 +60,10 @@
   }
 
   // a key keeps the first color it got, so filters and metric switches never repaint it
-  const PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#9085e9', '#e66767']
-  const OTHER = '#898781'
   const assigned: Partial<Record<Dim, Map<string, string>>> = {}
   const series = $derived(agg(rows, keyOf[dim]).sort((a, b) => valOf[metric](b) - valOf[metric](a)))
   const colorOf = $derived.by(() => {
+    if (dim === 'model') return new Map(series.map((a) => [a.key, modelColor(a.key)]))
     const m = (assigned[dim] ??= new Map())
     for (const a of series) if (!m.has(a.key) && m.size < PALETTE.length) m.set(a.key, PALETTE[m.size])
     return new Map(series.map((a) => [a.key, m.get(a.key) ?? OTHER]))
@@ -111,23 +104,9 @@
   const fmtDay = (d: string) => new Date(d + 'T00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
 
   const focusSessions = $derived([...new Set(focus.map((r) => r.s))])
-  // name -> [calls, sessions]
-  function usage(pick: (s: Session) => [string, number][]) {
-    const m = new Map<string, [number, number]>()
-    for (const s of focusSessions) for (const [n, c] of pick(s)) {
-      const e = m.get(n) ?? [0, 0]
-      e[0] += c; e[1]++
-      m.set(n, e)
-    }
-    return [...m].sort((a, b) => b[1][0] - a[1][0])
-  }
-  const lists = $derived<[string, string, [string, [number, number]][]][]>([
-    ['Tool calls', '', usage((s) => s.tools).slice(0, 30)],
-    ['Subagents', 'subagent types spawned (Agent / Task / spawn_agent calls)', usage((s) => s.subagents ?? [])],
-    ['Shell commands', 'programs invoked inside Bash / exec tool calls (git commit, cargo build, grep, …)', usage((s) => s.cmds ?? []).slice(0, 40)],
-    ['Skills', 'Skill tool calls + slash commands (Claude only)', usage((s) => s.skills)],
-    ['Hooks', 'hook executions by command (Claude only)', usage((s) => s.hooks)],
-  ])
+  const subCost = $derived(focus.reduce((a, r) => a + (r.s.parent_id ? r.cost : 0), 0))
+  const matrix = $derived(focus.map((r) => ({ ...r, key: keyOf[dim](r), id: r.s.id })))
+  const label = $derived(METRICS.find((m) => m[0] === metric)?.[1] ?? '')
 </script>
 
 {#snippet cols(r: Agg, max: number)}
@@ -148,13 +127,13 @@
     <th title="cache read + cache write tokens">cache</th>
     <th title="output tokens (incl. thinking)">out</th>
     <th title="API list price equivalent (subscription plans bill differently)">cost</th>
-    <th>{METRICS.find((m) => m[0] === metric)?.[1]}</th>
+    <th>{label}</th>
   </tr></thead>
 {/snippet}
 
-<div class="wrap" class:scoped>
+<div class="wrap">
   <div class="row">
-    {#if !scoped}<h2>Stats</h2><RangePicker />{/if}
+    <h2>Stats</h2><RangePicker />
     <select bind:value={metric}>{#each METRICS as [m, l]}<option value={m}>{l}</option>{/each}</select>
     <span class="dim">by</span>
     <select bind:value={dim}>{#each DIMS as d}<option value={d}>{d}</option>{/each}</select>
@@ -164,6 +143,7 @@
   {#if total}
     <div class="tiles">
       <div><b>{fmtCost(total.cost)}</b><span>cost</span></div>
+      {#if subCost}<div><b>{fmtCost(subCost)}</b><span>in subagents · {Math.round((100 * subCost) / total.cost)}%</span></div>{/if}
       <div><b>{total.ids.size}</b><span>sessions</span></div>
       <div><b>{total.subIds.size}</b><span>subagents</span></div>
       <div><b>{fmtNum(total.tools)}</b><span>tool calls</span></div>
@@ -211,6 +191,10 @@
       </tbody>
     </table>
     {#if dim === 'model'}<div class="note dim">tokens and cost are attributed per API call, so a session that switched models is split between them.</div>{/if}
+    {#if dim !== 'model'}
+      <h3 title="each cell: {label} of that {dim} on that model">{dim} × model · {label}{selDay ? ` · ${fmtDay(selDay)}` : ''}</h3>
+      <ModelMatrix rows={matrix} {metric} label={dim} />
+    {/if}
   {/if}
 
   {#if dayRows.length > 1}
@@ -227,20 +211,11 @@
     </table>
   {/if}
 
-  {#each lists as [title, hint, items]}
-    <h3 title={hint}>{title}{selDay ? ` · sessions active ${fmtDay(selDay)}` : ''}</h3>
-    <div class="tools">
-      {#each items as [n, [c, ns]]}
-        <div class="trow"><span class="mono" title={n}>{title === 'Hooks' ? shortHook(n) : n}</span><div class="bar" style="width:{(100 * c) / items[0][1][0]}%"></div><span class="dim">{c} <span class="dim2">in {ns} sessions</span></span></div>
-      {/each}
-      {#if !items.length}<span class="dim">none</span>{/if}
-    </div>
-  {/each}
+  <UsageLists sessions={focusSessions} suffix={selDay ? ` · sessions active ${fmtDay(selDay)}` : ''} />
 </div>
 
 <style>
   .wrap { padding: 16px; }
-  .wrap.scoped { padding: 12px 16px 40px; }
   h2 { margin: 0; font-size: 15px; }
   h3 { font-size: 13px; margin: 24px 0 8px; color: var(--fg2); }
   .tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -275,8 +250,4 @@
   tr.clickable:hover td, tr.selrow td { background: color-mix(in srgb, var(--fg) 5%, transparent); }
   .note { font-size: 11px; margin-top: 6px; }
   .chip { font: inherit; font-size: 11px; padding: 2px 8px; border: 1px solid var(--user); border-radius: 10px; background: color-mix(in srgb, var(--user) 25%, transparent); color: var(--fg); cursor: pointer; }
-  .tools { display: grid; grid-template-columns: max-content 1fr max-content; gap: 3px 10px; align-items: center; max-width: 700px; font-size: 12px; }
-  .trow { display: contents; }
-  .tools .bar { height: 10px; background: var(--tool); opacity: .6; border-radius: 2px; }
-  .dim2 { color: var(--fg3); font-size: 11px; }
 </style>
