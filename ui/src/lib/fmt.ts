@@ -1,7 +1,7 @@
 // thresholds sit at the rounding boundary so 9_950 -> "10k" and 999_500 -> "1.0M", never "10.0k" / "1000k"
 export const fmtNum = (n: number) => {
   const a = Math.abs(n)
-  return a >= 999_500 ? (n / 1e6).toFixed(1) + 'M' : a >= 1e3 ? (n / 1e3).toFixed(a >= 9_950 ? 0 : 1) + 'k' : String(n)
+  return a >= 999_950_000 ? (n / 1e9).toFixed(1) + 'B' : a >= 999_500 ? (n / 1e6).toFixed(1) + 'M' : a >= 1e3 ? (n / 1e3).toFixed(a >= 9_950 ? 0 : 1) + 'k' : String(n)
 }
 export const fmtCost = (c?: number) => (c == null ? '' : '$' + c.toFixed(c >= 1 ? 2 : 3))
 export const fmtDate = (s?: string) => (s ? new Date(s).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : '')
