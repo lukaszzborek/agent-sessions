@@ -60,7 +60,9 @@ const fn openai(input: f64, cached: f64, output: f64) -> Price {
 
 fn builtin() -> BTreeMap<String, Price> {
     let t: &[(&str, Price)] = &[
-        // Anthropic (platform.claude.com/docs/en/about-claude/pricing, 2026-09).
+        // Anthropic (platform.claude.com/docs/en/about-claude/pricing, 2026-11).
+        ("claude-fable-5-2", anthropic(8.0, 40.0, 0.2)),
+        ("claude-mythos-5-2", anthropic(8.0, 40.0, 0.2)),
         ("claude-fable-5-1", anthropic(10.0, 50.0, 0.25)),
         ("claude-mythos-5-1", anthropic(10.0, 50.0, 0.25)),
         ("claude-fable-5", anthropic(10.0, 50.0, 1.0)),
@@ -73,13 +75,20 @@ fn builtin() -> BTreeMap<String, Price> {
         ("claude-opus-4-5", anthropic(5.0, 25.0, 0.5)),
         ("claude-opus-4-1", anthropic(15.0, 75.0, 1.5)),
         ("claude-opus-4", anthropic(15.0, 75.0, 1.5)),
-        ("claude-sonnet-5-5", anthropic(2.0, 10.0, 0.2)),
+        ("claude-sonnet-5-5", anthropic(2.0, 10.0, 0.1)),
         ("claude-sonnet-5", anthropic(2.0, 10.0, 0.2)),
         ("claude-sonnet-4-6", anthropic(3.0, 15.0, 0.3)),
         ("claude-sonnet-4-5", anthropic(3.0, 15.0, 0.3)),
         ("claude-sonnet-4", anthropic(3.0, 15.0, 0.3)),
+        // Prompts over 100K tokens bill at 5x; usage here has no per-request prompt size.
+        ("claude-haiku-5-5", anthropic(0.1, 0.5, 0.01)),
         ("claude-haiku-4-5", anthropic(1.0, 5.0, 0.1)),
-        // OpenAI (developers.openai.com/api/docs/pricing, 2026-09).
+        // OpenAI (developers.openai.com/api/docs/pricing, 2026-11).
+        ("gpt-6-astra", openai(10.0, 1.0, 50.0)),
+        ("gpt-6.1-sol", openai(2.0, 0.10, 10.0)),
+        ("gpt-6.1-terra", openai(1.0, 0.05, 5.0)),
+        ("gpt-6-luna", openai(0.1, 0.01, 0.5)),
+        ("gpt-6-sol", openai(2.0, 0.20, 10.0)),
         ("gpt-5.6-sol", openai(4.0, 0.40, 20.0)),
         ("gpt-5.6-terra", openai(2.0, 0.20, 12.0)),
         ("gpt-5.6-luna", openai(0.2, 0.02, 1.2)),
