@@ -61,6 +61,8 @@ Anything else is added as a [source](#sources).
 **Stats** (`#/stats`) - date range, a metric (cost / out tok / total tok / tool calls) and a dimension (model / agent / subagent / project):
 totals, stacked per-day chart, table by the chosen dimension, table by day (click a day to focus it), then usage lists:
 tool calls, subagent types, shell commands, skills and hooks (last two Claude only).
+Range presets include the current and previous weekly rate-limit window of Claude (needs `limits.claude_week_reset`, see [config](#config))
+and Codex (read from its logs); these show only that agent's usage, to the hour.
 
 **Compare** (`#/compare`) - sessions sharing a tag side by side, grouped by a tag family. See [tags](#tags).
 
@@ -97,6 +99,9 @@ prom_url = "https://prometheus.example"  # env PROM_URL overrides
 
 [rtk]
 enabled = true                           # false: rtk history not read, stored or shown
+
+[limits]
+claude_week_reset = "thu 14:00"          # local time the Claude weekly limit resets (see /usage)
 
 [[sources]]
 name = "windows"
@@ -238,6 +243,7 @@ just dev-ui              # vite dev server, proxies /api to :7777
 | `GET /api/sessions/:agent/:id/events/:eid` | one event, untruncated |
 | `GET /api/sessions/:agent/:id/telemetry` | OTel enrichment; `null` when unset, not Claude, or nothing recorded |
 | `POST /api/sessions/:agent/:id/tags` | `{"add":[…],"remove":[…]}` |
+| `GET /api/limits` | `{"claude_week_reset": {"weekday","hour","minute"} \| null}` from config |
 | `POST /api/refresh` | rescan |
 | `GET /api/watch` | SSE, `["agent/id", …]` per change |
 
