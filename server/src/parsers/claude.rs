@@ -32,6 +32,8 @@ pub struct Claude {
     models: HashSet<String>,
     title: Option<String>,
     summary_title: Option<String>,
+    ai_title: Option<String>,
+    custom_title: Option<String>,
     cwd: String,
     sid: Option<String>,
     git_branch: Option<String>,
@@ -73,6 +75,8 @@ impl Claude {
             models: HashSet::new(),
             title: None,
             summary_title: None,
+            ai_title: None,
+            custom_title: None,
             cwd: String::new(),
             sid: None,
             git_branch: None,
@@ -127,6 +131,12 @@ impl Claude {
         match ty.as_str() {
             "summary" => {
                 self.summary_title = s(&v, "summary");
+            }
+            "ai-title" => {
+                self.ai_title = s(&v, "aiTitle");
+            }
+            "custom-title" => {
+                self.custom_title = s(&v, "customTitle");
             }
             "user" => self.user(&v, ts),
             "assistant" => self.assistant(&v, ts),
@@ -491,8 +501,10 @@ impl Claude {
             path: self.path.clone(),
             cwd: self.cwd.clone(),
             title: self
-                .summary_title
+                .custom_title
                 .clone()
+                .or_else(|| self.ai_title.clone())
+                .or_else(|| self.summary_title.clone())
                 .or_else(|| self.title.clone())
                 .unwrap_or_else(|| "(untitled)".into()),
             started: None,

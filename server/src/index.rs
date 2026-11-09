@@ -14,7 +14,7 @@ use turso::Connection;
 use walkdir::WalkDir;
 
 /// Bump when SessionSummary gains fields so stale DB rows get reparsed from stored raw.
-const VERSION: u32 = 12;
+const VERSION: u32 = 14;
 
 // Summed across builds so the watcher's per-change rebuilds are reported periodically, not one line each.
 static FILES_READ: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());

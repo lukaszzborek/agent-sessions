@@ -568,6 +568,8 @@ pub fn is_boilerplate(t: &str) -> bool {
         || t.starts_with("Caveat:")
         || t.starts_with("Stop hook feedback")
         || t.starts_with("[Request interrupted")
+        || t.starts_with("[Your previous response had no visible output")
+        || t.starts_with("Another Claude session sent a message")
         || t.starts_with("<command-name>")
         || t.starts_with("<local-command")
 }
