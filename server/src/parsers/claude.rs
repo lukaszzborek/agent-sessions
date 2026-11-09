@@ -534,6 +534,7 @@ impl Claude {
             request_ids,
             dup_request_ids: vec![],
             context_window: None,
+            week_reset: None,
         };
         if self.is_sub {
             // Subagent meta file.

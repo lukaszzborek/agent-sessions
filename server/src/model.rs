@@ -201,6 +201,9 @@ pub struct SessionSummary {
     /// Model context window when the log records it (Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Codex: unix time the weekly rate-limit window last reported by the log resets at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub week_reset: Option<i64>,
     /// Usage split by UTC hour + model, so stats can attribute long / multi-model sessions
     /// correctly.
     #[serde(default)]

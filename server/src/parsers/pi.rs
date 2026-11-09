@@ -227,6 +227,7 @@ pub fn parse(path: &Path, data: &[u8]) -> anyhow::Result<Parsed> {
         request_ids: vec![],
         dup_request_ids: vec![],
         context_window: None,
+        week_reset: None,
     };
     summarize_from_events(&mut summary, &mut events);
     if summary.started.is_none() {

@@ -75,6 +75,40 @@ pub struct Rtk {
     pub enabled: bool,
 }
 
+/// `[limits]`: subscription rate-limit windows, offered as stats ranges.
+#[derive(Debug, Default, Deserialize)]
+pub struct Limits {
+    /// Claude weekly limit reset in local time, e.g. `"thu 14:00"`; Claude logs don't record it.
+    claude_week_reset: Option<String>,
+    #[serde(skip)]
+    pub claude_week: Option<WeekReset>,
+}
+
+/// A weekly local-time moment.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct WeekReset {
+    /// 0 = Sunday, as JS `Date.getDay()`.
+    pub weekday: u8,
+    pub hour: u8,
+    pub minute: u8,
+}
+
+impl WeekReset {
+    fn parse(s: &str) -> Option<WeekReset> {
+        let (day, time) = s.trim().split_once(' ')?;
+        let days = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+        let day = day.to_ascii_lowercase();
+        let weekday = days.iter().position(|d| day.starts_with(d))? as u8;
+        let (h, m) = time.trim().split_once(':')?;
+        let (hour, minute) = (h.parse().ok()?, m.parse().ok()?);
+        (hour < 24 && minute < 60).then_some(WeekReset {
+            weekday,
+            hour,
+            minute,
+        })
+    }
+}
+
 impl Default for Telemetry {
     fn default() -> Telemetry {
         Telemetry {
@@ -97,6 +131,8 @@ pub struct Config {
     pub telemetry: Telemetry,
     #[serde(default)]
     pub rtk: Rtk,
+    #[serde(default)]
+    pub limits: Limits,
     /// Only the enabled, validly named entries survive loading.
     #[serde(default)]
     pub sources: Vec<Source>,
@@ -151,6 +187,14 @@ pub fn get() -> &'static Config {
             .take()
             .filter(|v| !v.trim().is_empty())
             .map(|v| v.trim_end_matches('/').to_string());
+        if let Some(s) = &c.limits.claude_week_reset {
+            c.limits.claude_week = WeekReset::parse(s);
+            if c.limits.claude_week.is_none() {
+                eprintln!(
+                    "config: limits.claude_week_reset {s:?} ignored (expected e.g. \"thu 14:00\")"
+                );
+            }
+        }
         let mut names = HashSet::from([USER_SOURCE.to_string()]);
         c.sources.retain(|s| {
             // Checked first so a disabled entry doesn't reserve its name.
@@ -188,4 +232,19 @@ pub fn get() -> &'static Config {
         }
         c
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn week_reset_parse() {
+        let r = WeekReset::parse("Thursday 14:05").expect("valid");
+        assert_eq!((r.weekday, r.hour, r.minute), (4, 14, 5));
+        assert!(WeekReset::parse("sun 0:00").is_some());
+        assert!(WeekReset::parse("thu 24:00").is_none());
+        assert!(WeekReset::parse("xyz 10:00").is_none());
+        assert!(WeekReset::parse("thu").is_none());
+    }
 }

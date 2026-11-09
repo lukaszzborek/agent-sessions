@@ -204,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions/{agent}/{id}/events/{eid}", get(get_event))
         .route("/api/sessions/{agent}/{id}/telemetry", get(get_telemetry))
         .route("/api/sessions/{agent}/{id}/tags", post(set_tags))
+        .route("/api/limits", get(limits))
         .route("/api/refresh", post(refresh))
         .route("/api/watch", get(watch))
         .fallback(static_handler)
@@ -241,6 +242,10 @@ async fn list_sessions(State(st): S) -> Json<Vec<SessionSummary>> {
         s.dup_request_ids.clear();
     }
     Json(sessions)
+}
+
+async fn limits() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "claude_week_reset": config::get().limits.claude_week }))
 }
 
 async fn refresh(State(st): S) -> Json<usize> {

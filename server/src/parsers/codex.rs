@@ -21,6 +21,7 @@ pub fn parse(path: &Path, data: &[u8], titles: &HashMap<String, String>) -> anyh
     let mut cur_model: Option<String> = None;
     let mut git_branch = None;
     let mut context_window = None;
+    let mut week_reset = None;
     let mut next_id = 0u32;
     let mut id = || {
         next_id += 1;
@@ -248,6 +249,13 @@ pub fn parse(path: &Path, data: &[u8], titles: &HashMap<String, String>) -> anyh
                         if let Some(w) = p["info"]["model_context_window"].as_u64() {
                             context_window = Some(w);
                         }
+                        // The weekly window is primary or secondary depending on the plan.
+                        for k in ["primary", "secondary"] {
+                            let l = &p["rate_limits"][k];
+                            if l["window_minutes"].as_u64() == Some(10080) {
+                                week_reset = l["resets_at"].as_i64().or(week_reset);
+                            }
+                        }
                         // input_tokens here already includes cached tokens.
                         if let (Some(n), Some(last)) = (
                             p["info"]["last_token_usage"]["input_tokens"].as_u64(),
@@ -396,6 +404,7 @@ pub fn parse(path: &Path, data: &[u8], titles: &HashMap<String, String>) -> anyh
         request_ids: vec![],
         dup_request_ids: vec![],
         context_window,
+        week_reset,
     };
     let st = summary.started.take();
     summarize_from_events(&mut summary, &mut events);
