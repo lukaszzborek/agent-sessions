@@ -6,6 +6,7 @@
   import Compare from './lib/Compare.svelte'
   import { live } from './lib/live.svelte'
   import { sourceFilter } from './lib/sources.svelte'
+  import { setLimits } from './lib/range.svelte'
 
   let sessions = $state.raw<Session[]>([])
   let loading = $state(true)
@@ -41,6 +42,8 @@
         const o = old.get(k)
         return o && ((keys && !keys.has(k)) || JSON.stringify(o) === JSON.stringify(s)) ? o : s
       })
+      const resets = new Set(sessions.flatMap((s) => (s.agent === 'codex' && s.week_reset ? [s.week_reset * 1000] : [])))
+      setLimits({ codexResets: [...resets].sort((a, b) => b - a) })
     } finally {
       if (my === loadGen) loading = false
     }
@@ -51,6 +54,7 @@
     await load()
   }
   load()
+  fetch('/api/limits').then((r) => r.json()).then((l) => setLimits({ claudeWeek: l.claude_week_reset })).catch(() => {})
   window.addEventListener('hashchange', () => (route = location.hash))
 
   // live: server pushes keys of sessions whose files changed; refresh list + bump per-session tick

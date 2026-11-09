@@ -10,7 +10,7 @@ export interface Session {
   models: string[]; user_msgs: number; assistant_msgs: number; tool_calls: number; tools: [string, number][]
   usage: Usage; cost?: number; parent_id?: string; children: string[]; git_branch?: string; archived?: boolean; version?: string; spawn_tool_call_id?: string
   hooks: [string, number][]; skills: [string, number][]; cmds: [string, number][]; subagents: [string, number][]; agent_type?: string
-  tags: string[]; source: string; max_context: number; context_window?: number
+  tags: string[]; source: string; max_context: number; context_window?: number; week_reset?: number
   buckets: { hour: string; model: string; usage: Usage; cost: number; tool_calls: number }[]
 }
 export interface Detail { summary: Session; events: Event[] }

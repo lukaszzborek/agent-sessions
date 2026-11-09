@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Session } from './types'
   import { fmtNum, fmtCost, project } from './fmt'
-  import { range } from './range.svelte'
+  import { range, hourKey } from './range.svelte'
   import RangePicker from './RangePicker.svelte'
   import ModelMatrix from './ModelMatrix.svelte'
   import UsageLists from './UsageLists.svelte'
@@ -28,11 +28,15 @@
     return d
   }
 
+  const fromHour = $derived(range.start ? hourKey(range.start) : '')
+  const toHour = $derived(range.end ? hourKey(range.end) : '')
   const rows = $derived.by(() => {
     const out: Row[] = []
     for (const s of sessions) for (const b of s.buckets ?? []) {
+      if (range.agent && s.agent !== range.agent) continue
       const day = localDay(b.hour)
       if ((range.from && day < range.from) || (range.to && day > range.to)) continue
+      if ((fromHour && b.hour < fromHour) || (toHour && b.hour >= toHour)) continue
       out.push({ day, s, model: b.model, tools: b.tool_calls, input: b.usage.input, cache: b.usage.cache_read + b.usage.cache_write, output: b.usage.output, cost: b.cost })
     }
     return out
