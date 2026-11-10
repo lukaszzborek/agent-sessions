@@ -36,9 +36,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 22.04 so the binary links against an older glibc and runs on older distros
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          # pinned, not -latest: the build runner's glibc (2.39) is the minimum the binary needs
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
           - { target: aarch64-apple-darwin, os: macos-15 }
           # cross-compiled on the arm64 runner; Intel runners are being phased out
           - { target: x86_64-apple-darwin, os: macos-15 }
